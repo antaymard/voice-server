@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>voice-server demo</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 2rem 1rem; min-height: 100vh;
+      background: #0d1117; color: #e6edf3;
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      display: flex; justify-content: center;
+    }
+    main { width: 100%; max-width: 720px; }
+    h1 { font-size: 1.3rem; margin: 0 0 0.25rem; }
+    h2 { font-size: 0.95rem; margin: 0 0 0.75rem; color: #8b949e; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+    p.sub { color: #8b949e; margin: 0 0 1.5rem; font-size: 0.9rem; }
+    section { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 1.25rem; margin-bottom: 1.25rem; }
+    label { display: block; font-size: 0.8rem; color: #8b949e; margin-bottom: 0.25rem; }
+    input[type="text"], input[type="password"], select {
+      width: 100%; padding: 0.5rem 0.65rem; border-radius: 6px;
+      border: 1px solid #30363d; background: #0d1117; color: #e6edf3; font-size: 0.9rem;
+    }
+    .row { display: flex; gap: 0.75rem; margin-bottom: 0.9rem; flex-wrap: wrap; }
+    .row > div { flex: 1; min-width: 140px; }
+    button {
+      padding: 0.55rem 1.1rem; border-radius: 6px; border: 1px solid #30363d;
+      background: #21262d; color: #e6edf3; font-size: 0.9rem; cursor: pointer;
+    }
+    button.primary { background: #1f6feb; border-color: #1f6feb; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .status { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; color: #8b949e; margin-left: 0.75rem; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #484f58; }
+    .dot.live { background: #3fb950; box-shadow: 0 0 6px #3fb950; animation: pulse 1.2s infinite; }
+    .dot.err { background: #f85149; }
+    @keyframes pulse { 50% { opacity: 0.4; } }
+    .transcript {
+      min-height: 7rem; margin-top: 1rem; padding: 0.9rem; border-radius: 6px;
+      background: #0d1117; border: 1px solid #30363d; white-space: pre-wrap;
+      font-size: 1rem; line-height: 1.55;
+    }
+    .transcript:empty::before { content: "…"; color: #484f58; }
+    .meta { font-size: 0.78rem; color: #8b949e; margin-top: 0.5rem; min-height: 1.1em; }
+    pre { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 0.9rem; overflow-x: auto; font-size: 0.82rem; white-space: pre-wrap; }
+    pre:empty { display: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>voice-server</h1>
+    <p class="sub">Speech-to-text demo — realtime mic streaming and bulk file transcription via Mistral Voxtral.</p>
+
+    <section>
+      <h2>Auth</h2>
+      <label for="token">Server token (AUTH_TOKEN)</label>
+      <input type="password" id="token" placeholder="paste the AUTH_TOKEN configured on the server" autocomplete="off" />
+    </section>
+
+    <section>
+      <h2>Realtime (microphone)</h2>
+      <div class="row">
+        <div>
+          <label for="delay">Target delay</label>
+          <select id="delay">
+            <option value="240">240 ms — fastest</option>
+            <option value="480" selected>480 ms — balanced</option>
+            <option value="1000">1000 ms — accurate</option>
+            <option value="2400">2400 ms — most accurate</option>
+          </select>
+        </div>
+      </div>
+      <button id="micStart" class="primary">Start mic</button>
+      <button id="micStop" disabled>Stop</button>
+      <span class="status"><span class="dot" id="micDot"></span><span id="micStatus">idle</span></span>
+      <div class="transcript" id="transcript"></div>
+      <div class="meta">language: <span id="lang">–</span></div>
+    </section>
+
+    <section>
+      <h2>Bulk (file upload)</h2>
+      <div class="row">
+        <div>
+          <label for="file">Audio file (mp3, wav, m4a…)</label>
+          <input type="file" id="file" accept="audio/*" />
+        </div>
+        <div>
+          <label for="blang">Language (optional)</label>
+          <input type="text" id="blang" placeholder="e.g. fr" maxlength="5" />
+        </div>
+      </div>
+      <button id="bulkSend" class="primary">Transcribe file</button>
+      <span class="status" id="bulkStatus"></span>
+      <pre id="bulkResult"></pre>
+    </section>
+  </main>
+  <script src="/demo.js"></script>
+</body>
+</html>

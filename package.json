@@ -1,0 +1,30 @@
+{
+  "name": "voice-server",
+  "version": "0.1.0",
+  "description": "Minimal speech-to-text backend for React apps, powered by the Mistral (Voxtral) API. Realtime WebSocket bridge + bulk file transcription.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "mock": "node test/mock-mistral.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "@mistralai/mistralai": "2.2.5",
+    "hono": "^4.7.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/ws": "^8",
+    "typescript": "^5.8.0"
+  }
+}
