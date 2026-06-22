@@ -156,6 +156,13 @@ const { text } = await transcribeFile(file, { serverUrl, token });
 3. Deploy; WebSockets work through Railway's proxy out of the box.
 4. In each React app, set the server URL + token and use the kit.
 
+> **Healthcheck stuck on "service unavailable"?** The server refuses to boot
+> when a required variable (`MISTRAL_API_KEY`, `AUTH_TOKEN`, `ALLOWED_ORIGINS`)
+> is missing, so it crash-loops and `/healthz` never comes up. The healthcheck
+> log only shows the failed attempts — open the **Deploy Logs** tab to see the
+> real cause (`Configuration error: Missing required environment variables: …`),
+> set the variable, and redeploy.
+
 ## Development
 
 ```bash

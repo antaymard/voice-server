@@ -37,7 +37,21 @@ export function startServer(config: Config): Promise<RunningServer> {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isMain) {
-  const config = loadConfig();
+  let config: Config;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(
+      `\n[voice-server] Configuration error: ${message}\n` +
+        `The server cannot start until this is fixed, so platform healthchecks ` +
+        `(e.g. Railway's /healthz) will keep reporting "service unavailable".\n` +
+        `Set the required variables in your host's environment ` +
+        `(on Railway: your service -> Variables), then redeploy. ` +
+        `See the "Configuration" table in README.md.\n`,
+    );
+    process.exit(1);
+  }
   const running = await startServer(config);
   console.log(`voice-server listening on :${running.port}`);
 
