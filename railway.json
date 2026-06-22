@@ -5,6 +5,7 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
+    "startCommand": "node dist/src/index.js",
     "healthcheckPath": "/healthz",
     "restartPolicyType": "ON_FAILURE"
   }

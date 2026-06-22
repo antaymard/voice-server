@@ -163,12 +163,15 @@ const { text } = await transcribeFile(file, { serverUrl, token });
 > - `Configuration error: Missing required environment variables: …` — a
 >   required variable (`MISTRAL_API_KEY`, `AUTH_TOKEN`, `ALLOWED_ORIGINS`) is
 >   not set, so the server refuses to boot and crash-loops. Set it and redeploy.
-> - `npm error … Could not read package.json … /app/package.json` — the
->   container is being launched with an `npm` command (e.g. a **Custom Start
->   Command** in the service settings that overrides the Dockerfile `CMD`).
->   Either clear that custom start command so the image's `CMD`
->   (`node dist/src/index.js`) runs, or keep `npm start` — the image ships
->   `package.json` so both work.
+> - `sh: 1: tsc: not found` (or `npm error … Could not read package.json`)
+>   repeating on every restart — the container is being launched with the wrong
+>   command: a **Custom Start Command** in the service settings that runs
+>   `npm run build`/`npm start` at *runtime*, against the production image whose
+>   devDependencies (`tsc` included) were pruned. `railway.json` pins
+>   `startCommand` to `node dist/src/index.js`, and config-as-code overrides the
+>   dashboard, so redeploying from this repo neutralizes a stray custom start
+>   command. If you genuinely need a custom start, edit `startCommand` in
+>   `railway.json`, not the dashboard.
 
 ## Development
 
