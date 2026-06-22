@@ -156,12 +156,19 @@ const { text } = await transcribeFile(file, { serverUrl, token });
 3. Deploy; WebSockets work through Railway's proxy out of the box.
 4. In each React app, set the server URL + token and use the kit.
 
-> **Healthcheck stuck on "service unavailable"?** The server refuses to boot
-> when a required variable (`MISTRAL_API_KEY`, `AUTH_TOKEN`, `ALLOWED_ORIGINS`)
-> is missing, so it crash-loops and `/healthz` never comes up. The healthcheck
-> log only shows the failed attempts — open the **Deploy Logs** tab to see the
-> real cause (`Configuration error: Missing required environment variables: …`),
-> set the variable, and redeploy.
+> **Healthcheck stuck on "service unavailable"?** Open the **Deploy Logs** tab
+> (not the Healthcheck log) to see why the container never came up. Two common
+> causes:
+>
+> - `Configuration error: Missing required environment variables: …` — a
+>   required variable (`MISTRAL_API_KEY`, `AUTH_TOKEN`, `ALLOWED_ORIGINS`) is
+>   not set, so the server refuses to boot and crash-loops. Set it and redeploy.
+> - `npm error … Could not read package.json … /app/package.json` — the
+>   container is being launched with an `npm` command (e.g. a **Custom Start
+>   Command** in the service settings that overrides the Dockerfile `CMD`).
+>   Either clear that custom start command so the image's `CMD`
+>   (`node dist/src/index.js`) runs, or keep `npm start` — the image ships
+>   `package.json` so both work.
 
 ## Development
 
