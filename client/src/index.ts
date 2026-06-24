@@ -10,6 +10,12 @@ export {
   type TranscribeFileOptions,
   type TranscribeResult,
 } from "./transcribeFile.ts";
+export {
+  synthesizeSpeech,
+  SpeechError,
+  type SynthesizeOptions,
+  type SpeechFormat,
+} from "./synthesizeSpeech.ts";
 export { createPcmWorkletUrl, PCM_PROCESSOR_SOURCE } from "./worklet.ts";
 export type {
   ClientMessage,

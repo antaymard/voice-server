@@ -6,6 +6,7 @@ import type { Mistral } from "@mistralai/mistralai";
 import { bearerToken, isOriginAllowed, safeEqual } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { createTranscribeHandler } from "./transcribe.ts";
+import { createSynthesizeHandler } from "./synthesize.ts";
 
 export type AppDeps = {
   batch: Mistral;
@@ -54,6 +55,8 @@ export function createApp(config: Config, deps: AppDeps): Hono {
     }),
     createTranscribeHandler(deps.batch, config),
   );
+
+  app.post("/v1/speak", createSynthesizeHandler(deps.batch, config));
 
   // Demo page (mic + file upload). Static files are public; API calls made
   // from the page still require the token.

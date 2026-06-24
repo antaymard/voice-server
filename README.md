@@ -8,6 +8,8 @@ Minimal speech-to-text backend for React apps, powered by the
   (sub-second latency, tunable).
 - **Bulk**: upload a complete audio file (or pass a URL), get the transcript
   back as JSON.
+- **Text to speech**: POST text, stream back raw audio (Mistral Voxtral TTS),
+  latency-tuned (`pcm` streaming for the fastest time-to-first-audio).
 - One shared token for all your apps + an origin allowlist; your
   `MISTRAL_API_KEY` never leaves the server.
 - Ships a copyable **React kit** (`client/`) — mic capture worklet,
@@ -63,6 +65,39 @@ curl -X POST https://your-server/v1/transcribe \
 Responses are passed through from Mistral. Uploads above `MAX_UPLOAD_BYTES`
 get `413`; upstream auth problems surface as `502 upstream_auth` (it's the
 server's key, not yours).
+
+### `POST /v1/speak` — text to speech
+
+Powered by Mistral's [Voxtral TTS](https://docs.mistral.ai/studio-api/audio/text_to_speech).
+`application/json` body:
+
+| Field | Required | Default | Notes |
+|---|---|---|---|
+| `input` | yes | — | text to synthesize (≤ `MAX_TTS_CHARS`) |
+| `format` | no | `pcm` | `pcm`, `wav`, `mp3`, `flac` or `opus` |
+| `voice` | no | `TTS_VOICE` | preset or saved voice id; omit for the Mistral default |
+| `ref_audio` | no | — | base64 audio for one-off zero-shot voice cloning |
+| `model` | no | `TTS_MODEL` | override the synthesis model |
+| `stream` | no | `true` | stream audio as it is generated (lowest latency) |
+
+The response body is the **raw audio bytes** (not base64/JSON) with a matching
+`Content-Type`, streamed chunk-by-chunk via chunked transfer when `stream` is
+true. `pcm` is headerless, so the parameters needed to play it back ride along
+on response headers: `X-Sample-Rate: 24000`, `X-Audio-Channels: 1`,
+`X-Audio-Encoding: pcm_s16le`.
+
+```bash
+curl -X POST https://your-server/v1/speak \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"input":"Bonjour le monde","format":"mp3"}' \
+  --output hello.mp3
+```
+
+**Latency:** streaming + `pcm` minimizes time-to-first-audio (~0.8 s
+end-to-end from Mistral, vs ~3 s for `mp3`, which is encoded before it streams).
+Pick `pcm` for live playback and `mp3`/`opus` when you want a self-describing
+file you can drop straight into an `<audio>` element.
 
 ### `GET /healthz`
 
@@ -128,6 +163,11 @@ const { status, text, start, stop } = useRealtimeTranscription({
 const { text } = await transcribeFile(file, { serverUrl, token });
 ```
 
+```ts
+const res = await synthesizeSpeech("Bonjour le monde", { serverUrl, token, format: "mp3" });
+new Audio(URL.createObjectURL(await res.blob())).play();
+```
+
 ## Configuration
 
 | Env var | Required | Default | Purpose |
@@ -138,6 +178,10 @@ const { text } = await transcribeFile(file, { serverUrl, token });
 | `PORT` | no | `3000` | injected by Railway |
 | `BATCH_MODEL` | no | `voxtral-mini-latest` | bulk transcription model |
 | `REALTIME_MODEL` | no | `voxtral-mini-transcribe-realtime-2602` | realtime model |
+| `TTS_MODEL` | no | `voxtral-mini-tts-2603` | text-to-speech model |
+| `TTS_VOICE` | no | — | default voice id (empty = Mistral's default) |
+| `TTS_FORMAT` | no | `pcm` | default output format when the request omits one |
+| `MAX_TTS_CHARS` | no | `8000` | max characters per `/v1/speak` request |
 | `MAX_UPLOAD_BYTES` | no | `26214400` (25 MB) | bulk upload cap |
 | `MAX_SESSIONS` | no | `20` | concurrent realtime sessions |
 | `MAX_SESSION_MS` | no | `600000` (10 min) | per-session duration cap |

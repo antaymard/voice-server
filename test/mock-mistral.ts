@@ -1,6 +1,7 @@
 /**
  * Mock of the Mistral API surface used by voice-server:
  * - POST /v1/audio/transcriptions (batch)
+ * - POST /v1/audio/speech (text-to-speech, JSON one-shot or SSE stream)
  * - WS   /v1/audio/transcriptions/realtime (realtime)
  *
  * Deterministic behavior for tests:
@@ -34,6 +35,18 @@ export const BATCH_FIXTURE = {
   usage: { prompt_tokens: 4, completion_tokens: 6, total_tokens: 10, prompt_audio_seconds: 2 },
 };
 
+/** Decoded bytes the speech mock produces (streamed as two deltas, or in one shot). */
+export const SPEECH_FIXTURE_BYTES = Buffer.from("MOCKAUDIO");
+const SPEECH_CHUNKS = ["MOCK", "AUDIO"]; // concatenate to SPEECH_FIXTURE_BYTES
+
+function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+  return new Promise((resolve) => {
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => resolve(raw));
+  });
+}
+
 export function startMockMistral(port = 0): Promise<MockMistral> {
   const httpServer = createServer((req, res) => {
     if (req.method === "POST" && req.url === "/v1/audio/transcriptions") {
@@ -47,6 +60,40 @@ export function startMockMistral(port = 0): Promise<MockMistral> {
         if (auth.includes("bad-key")) return json(401, { message: "Unauthorized" });
         if (auth.includes("key-400")) return json(400, { object: "error", message: "Invalid request (mock)" });
         return json(200, BATCH_FIXTURE);
+      });
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/audio/speech") {
+      const auth = req.headers.authorization ?? "";
+      void readBody(req).then((raw) => {
+        const json = (status: number, body: unknown): void => {
+          res.writeHead(status, { "content-type": "application/json" });
+          res.end(JSON.stringify(body));
+        };
+        if (auth.includes("bad-key")) return json(401, { message: "Unauthorized" });
+        if (auth.includes("key-400")) return json(400, { object: "error", message: "Invalid request (mock)" });
+        let stream = false;
+        try {
+          stream = JSON.parse(raw)?.stream === true;
+        } catch {
+          return json(400, { object: "error", message: "Bad JSON (mock)" });
+        }
+        if (!stream) {
+          return json(200, { audio_data: SPEECH_FIXTURE_BYTES.toString("base64") });
+        }
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        for (const chunk of SPEECH_CHUNKS) {
+          const data = JSON.stringify({
+            type: "speech.audio.delta",
+            audio_data: Buffer.from(chunk).toString("base64"),
+          });
+          res.write(`event: speech.audio.delta\ndata: ${data}\n\n`);
+        }
+        res.end();
       });
       return;
     }
