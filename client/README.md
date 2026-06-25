@@ -83,6 +83,35 @@ async function onFilePicked(file: File) {
 }
 ```
 
+## Text to speech
+
+```ts
+import { synthesizeSpeech, SpeechError } from "./voice/index.ts";
+
+async function say(text: string) {
+  try {
+    // mp3 plays directly in an <audio>; pcm has the lowest latency (see below).
+    const res = await synthesizeSpeech(text, {
+      serverUrl: import.meta.env.VITE_VOICE_SERVER_URL,
+      token: import.meta.env.VITE_VOICE_SERVER_TOKEN,
+      format: "mp3",
+      // voice: "neutral_female",  // preset/saved voice, optional
+    });
+    const url = URL.createObjectURL(await res.blob());
+    await new Audio(url).play();
+  } catch (err) {
+    if (err instanceof SpeechError) console.error(err.status, err.code, err.message);
+    throw err;
+  }
+}
+```
+
+`synthesizeSpeech` returns the raw `fetch` Response, so the body streams
+chunk-by-chunk. For the lowest end-to-end latency, request `format: "pcm"`
+(24 kHz mono s16le, advertised on the `X-Sample-Rate` / `X-Audio-Encoding`
+response headers) and feed `res.body` into the Web Audio API as chunks arrive
+instead of awaiting the whole `.blob()`.
+
 ## Security note
 
 The token is visible to anyone who can read your app's bundle; the server's
