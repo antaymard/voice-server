@@ -114,10 +114,15 @@ export function createSynthesizeHandler(batch: Mistral, config: Config) {
         { acceptHeaderOverride: CompleteAcceptEnum.textEventStream },
       );
       const iterator = events[Symbol.asyncIterator]();
+      // Pull the first event before committing to a 200: upstream failures
+      // that happen before any audio flows become proper JSON errors instead
+      // of an empty body with a success status the client can't distinguish
+      // from a short clip.
+      const first = await iterator.next();
       const body = new ReadableStream<Uint8Array>({
         async start(controller) {
           try {
-            for (let next = await iterator.next(); !next.done; next = await iterator.next()) {
+            for (let next = first; !next.done; next = await iterator.next()) {
               const data = next.value.data;
               if (data.type === "speech.audio.delta") {
                 controller.enqueue(Buffer.from(data.audioData, "base64"));
@@ -125,6 +130,9 @@ export function createSynthesizeHandler(batch: Mistral, config: Config) {
             }
             controller.close();
           } catch (err) {
+            // The 200 is already on the wire; aborting the body is the only
+            // signal left for the client, so keep a server-side trace too.
+            console.error("[synthesize] upstream stream failed mid-response:", err);
             controller.error(err);
           }
         },

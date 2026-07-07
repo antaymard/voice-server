@@ -92,6 +92,9 @@ export function runSession(
 
   const fail = (code: ServerErrorCode, message: string, closeCode: number): void => {
     if (finished) return;
+    // The client gets the error event, but keep a server-side trace too — a
+    // client that mishandles the event otherwise leaves nothing to debug with.
+    console.warn(`[realtime] session error (${code}, close ${closeCode}): ${message}`);
     send({ type: "error", code, message });
     finish(closeCode, code);
   };

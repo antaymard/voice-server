@@ -16,6 +16,19 @@ export type AppDeps = {
 export function createApp(config: Config, deps: AppDeps): Hono {
   const app = new Hono();
 
+  // Every response — including crashes and unknown routes — uses the JSON
+  // error envelope, so clients never have to special-case plain-text bodies.
+  app.onError((err, c) => {
+    console.error(`[http] unhandled error on ${c.req.method} ${c.req.path}:`, err);
+    return c.json({ error: { code: "internal_error", message: "Internal server error" } }, 500);
+  });
+  app.notFound((c) =>
+    c.json(
+      { error: { code: "not_found", message: `No route for ${c.req.method} ${c.req.path}` } },
+      404,
+    ),
+  );
+
   app.get("/healthz", (c) =>
     c.json({ ok: true, uptime: Math.round(process.uptime()), activeSessions: deps.activeSessions() }),
   );
@@ -23,7 +36,13 @@ export function createApp(config: Config, deps: AppDeps): Hono {
   app.use(
     "/v1/*",
     cors({
-      origin: (origin) => (isOriginAllowed(origin, config.allowedOrigins) ? origin : ""),
+      origin: (origin) => {
+        if (isOriginAllowed(origin, config.allowedOrigins)) return origin;
+        // The browser hides CORS failures from the page ("Failed to fetch"),
+        // so leave a server-side trace of why the request was blocked.
+        console.warn(`[http] blocked CORS origin "${origin}" (not in ALLOWED_ORIGINS)`);
+        return "";
+      },
       allowMethods: ["GET", "POST", "OPTIONS"],
       allowHeaders: ["Authorization", "Content-Type"],
       maxAge: 86400,

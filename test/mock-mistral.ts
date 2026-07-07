@@ -6,6 +6,8 @@
  *
  * Deterministic behavior for tests:
  * - batch: api key containing "bad-key" -> 401, "key-400" -> 400, else fixture.
+ * - speech: same key rules; "key-stream-error" -> SSE response whose socket
+ *   dies before any audio delta (simulates an upstream failure mid-handshake).
  * - realtime: replies `session.created`, echoes `session.updated`, emits one
  *   `transcription.language` on the first audio append, one
  *   `transcription.text.delta` ("p1 ", "p2 ", ...) per append, and
@@ -72,6 +74,12 @@ export function startMockMistral(port = 0): Promise<MockMistral> {
         };
         if (auth.includes("bad-key")) return json(401, { message: "Unauthorized" });
         if (auth.includes("key-400")) return json(400, { object: "error", message: "Invalid request (mock)" });
+        if (auth.includes("key-stream-error")) {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.flushHeaders();
+          setTimeout(() => res.destroy(), 10);
+          return;
+        }
         let stream = false;
         try {
           stream = JSON.parse(raw)?.stream === true;

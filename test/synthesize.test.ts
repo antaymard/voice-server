@@ -112,6 +112,18 @@ test("maps upstream 401 to 502 upstream_auth", async () => {
   assert.equal(body.error.code, "upstream_auth");
 });
 
+test("stream failing before any audio returns a JSON error, not an empty 200", async () => {
+  const dying = buildApp("key-stream-error");
+  const res = await dying.request("/v1/speak", {
+    method: "POST",
+    headers: authHeader,
+    body: JSON.stringify({ input: "hello" }),
+  });
+  assert.equal(res.status, 502);
+  const body = await res.json();
+  assert.equal(body.error.code, "upstream_error");
+});
+
 test("passes through upstream 400", async () => {
   const key400 = buildApp("key-400");
   const res = await key400.request("/v1/speak", {
