@@ -38,7 +38,11 @@ MISTRAL_BASE_URL=http://127.0.0.1:9099 MISTRAL_WS_URL=ws://127.0.0.1:9099 npm ru
 ## HTTP API
 
 All `/v1/*` endpoints require `Authorization: Bearer <AUTH_TOKEN>`.
-Errors use a uniform envelope: `{ "error": { "code", "message" } }`.
+Errors use a uniform envelope: `{ "error": { "code", "message" } }` — this
+includes unknown routes (`404 not_found`) and unexpected server failures
+(`500 internal_error`), so a client can always parse the body as JSON when
+the status is not 2xx. Blocked CORS origins and rejected WebSocket upgrades
+are logged server-side (the browser only shows an opaque network error).
 
 ### `POST /v1/transcribe` — bulk transcription
 
@@ -85,6 +89,12 @@ The response body is the **raw audio bytes** (not base64/JSON) with a matching
 true. `pcm` is headerless, so the parameters needed to play it back ride along
 on response headers: `X-Sample-Rate: 24000`, `X-Audio-Channels: 1`,
 `X-Audio-Encoding: pcm_s16le`.
+
+Upstream failures that happen before any audio is produced return a JSON
+error (`4xx`/`502`) even in streaming mode — the first audio chunk is awaited
+before the `200` is committed. If the upstream dies *mid*-stream, the only
+remaining signal is an aborted response body: a robust client should treat a
+truncated read as an error, not as a short clip.
 
 ```bash
 curl -X POST https://your-server/v1/speak \

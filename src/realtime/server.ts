@@ -18,7 +18,10 @@ const STATUS_TEXT: Record<number, string> = {
   503: "Service Unavailable",
 };
 
-function rejectUpgrade(socket: Duplex, status: number): void {
+function rejectUpgrade(socket: Duplex, status: number, reason: string): void {
+  // A rejected upgrade surfaces client-side as a bare connection failure,
+  // so the server log is the only place the actual cause is visible.
+  console.warn(`[realtime] rejected WebSocket upgrade (${status}): ${reason}`);
   socket.write(
     `HTTP/1.1 ${status} ${STATUS_TEXT[status] ?? "Error"}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
   );
@@ -52,27 +55,27 @@ export function attachRealtime(
       pathname = url.pathname;
       token = url.searchParams.get("token") ?? bearerToken(req.headers.authorization);
     } catch {
-      rejectUpgrade(socket, 400);
+      rejectUpgrade(socket, 400, `unparseable request URL "${req.url ?? ""}"`);
       return;
     }
     if (pathname !== "/v1/realtime") {
-      rejectUpgrade(socket, 404);
+      rejectUpgrade(socket, 404, `unknown path "${pathname}"`);
       return;
     }
     if (shuttingDown) {
-      rejectUpgrade(socket, 503);
+      rejectUpgrade(socket, 503, "server is shutting down");
       return;
     }
     if (!token || !safeEqual(token, config.authToken)) {
-      rejectUpgrade(socket, 401);
+      rejectUpgrade(socket, 401, token ? "invalid token" : "missing token");
       return;
     }
     if (!isOriginAllowed(req.headers.origin, config.allowedOrigins)) {
-      rejectUpgrade(socket, 403);
+      rejectUpgrade(socket, 403, `origin "${req.headers.origin}" not in ALLOWED_ORIGINS`);
       return;
     }
     if (sessions.size >= config.maxSessions) {
-      rejectUpgrade(socket, 429);
+      rejectUpgrade(socket, 429, `session limit reached (MAX_SESSIONS=${config.maxSessions})`);
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
