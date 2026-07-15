@@ -17,7 +17,7 @@ function buildApp(apiKey = "mock-api-key", overrides = {}): Hono {
     ...overrides,
   });
   const { batch } = createMistralClients(config);
-  return createApp(config, { batch, activeSessions: () => 0 });
+  return createApp(config, { batch, gladia: null, activeSessions: () => 0 });
 }
 
 function audioForm(extra: Record<string, string> = {}): FormData {

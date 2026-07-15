@@ -13,7 +13,8 @@
     "start": "node dist/src/index.js",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "mock": "node test/mock-mistral.ts"
+    "mock": "node test/mock-mistral.ts",
+    "mock:gladia": "node test/mock-gladia.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",

@@ -5,6 +5,8 @@ import type { RealtimeTranscription } from "@mistralai/mistralai/extra/realtime"
 import { CLOSE_SHUTDOWN, type ServerErrorEvent } from "../../client/src/protocol.ts";
 import { bearerToken, isOriginAllowed, safeEqual } from "../auth.ts";
 import type { Config } from "../config.ts";
+import type { GladiaClient } from "../gladia/client.ts";
+import { runGladiaSession } from "../gladia/bridge.ts";
 import { runSession } from "./bridge.ts";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -33,9 +35,15 @@ export type RealtimeControl = {
   shutdown: () => void;
 };
 
+export type RealtimeDeps = {
+  realtime: RealtimeTranscription;
+  /** null when GLADIA_API_KEY is not configured (upgrades answer 503). */
+  gladia: GladiaClient | null;
+};
+
 export function attachRealtime(
   server: HttpServer,
-  realtime: RealtimeTranscription,
+  deps: RealtimeDeps,
   config: Config,
 ): RealtimeControl {
   const wss = new WebSocketServer({
@@ -58,8 +66,12 @@ export function attachRealtime(
       rejectUpgrade(socket, 400, `unparseable request URL "${req.url ?? ""}"`);
       return;
     }
-    if (pathname !== "/v1/realtime") {
+    if (pathname !== "/v1/realtime" && pathname !== "/v1/gladia/realtime") {
       rejectUpgrade(socket, 404, `unknown path "${pathname}"`);
+      return;
+    }
+    if (pathname === "/v1/gladia/realtime" && !deps.gladia) {
+      rejectUpgrade(socket, 503, "Gladia endpoints are disabled (set GLADIA_API_KEY)");
       return;
     }
     if (shuttingDown) {
@@ -82,7 +94,12 @@ export function attachRealtime(
       sessions.add(ws);
       alive.set(ws, true);
       ws.on("pong", () => alive.set(ws, true));
-      runSession(ws, realtime, config, () => sessions.delete(ws));
+      const onClose = (): void => void sessions.delete(ws);
+      if (pathname === "/v1/gladia/realtime") {
+        runGladiaSession(ws, deps.gladia as GladiaClient, config, onClose);
+      } else {
+        runSession(ws, deps.realtime, config, onClose);
+      }
     });
   });
 

@@ -11,7 +11,7 @@ import { makeConfig } from "./helpers.ts";
 function buildApp(): Hono {
   const config = makeConfig();
   const { batch } = createMistralClients(config);
-  return createApp(config, { batch, activeSessions: () => 0 });
+  return createApp(config, { batch, gladia: null, activeSessions: () => 0 });
 }
 
 test("unknown routes return the JSON error envelope", async () => {

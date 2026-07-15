@@ -24,6 +24,23 @@ export type Config = {
   defaultTargetDelayMs: number;
   mistralBaseUrl: string;
   mistralWsUrl: string;
+  /** Gladia API key; "" disables the /v1/gladia/* endpoints. */
+  gladiaApiKey: string;
+  gladiaBaseUrl: string;
+  /**
+   * Pre-recorded model. "solaria-1" (default): 100+ languages, best on
+   * clean/formal/read speech, also the only one available live. "solaria-3":
+   * best on noisy/production audio, but async-only and restricted to a
+   * single language among en/fr/de/es/it (see SOLARIA_3_LANGUAGES).
+   */
+  gladiaBulkModel: "solaria-1" | "solaria-3";
+  /** Live model override, or "" to let Gladia pick its default (solaria-1; the only model live supports as of writing). */
+  gladiaLiveModel: string;
+  /** Region for live sessions ("eu-west", "us-west"), or "" for Gladia's default. */
+  gladiaRegion: string;
+  /** Bulk transcription polling cadence and cap. */
+  gladiaPollIntervalMs: number;
+  gladiaPollTimeoutMs: number;
 };
 
 function intEnv(env: Record<string, string | undefined>, name: string, fallback: number): number {
@@ -45,6 +62,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const ttsFormat = (env["TTS_FORMAT"] || "pcm").toLowerCase();
   if (!(SPEECH_FORMATS as readonly string[]).includes(ttsFormat)) {
     throw new Error(`Invalid TTS_FORMAT "${ttsFormat}": use one of ${SPEECH_FORMATS.join(", ")}`);
+  }
+
+  const gladiaBulkModel = env["GLADIA_BULK_MODEL"] || "solaria-1";
+  if (gladiaBulkModel !== "solaria-1" && gladiaBulkModel !== "solaria-3") {
+    throw new Error(`Invalid GLADIA_BULK_MODEL "${gladiaBulkModel}": use "solaria-1" or "solaria-3"`);
   }
 
   const authToken = env["AUTH_TOKEN"] as string;
@@ -85,5 +107,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     defaultTargetDelayMs: intEnv(env, "DEFAULT_TARGET_DELAY_MS", 480),
     mistralBaseUrl: env["MISTRAL_BASE_URL"] || "https://api.mistral.ai",
     mistralWsUrl: env["MISTRAL_WS_URL"] || "wss://api.mistral.ai",
+    gladiaApiKey: env["GLADIA_API_KEY"] || "",
+    gladiaBaseUrl: (env["GLADIA_BASE_URL"] || "https://api.gladia.io").replace(/\/$/, ""),
+    gladiaBulkModel,
+    gladiaLiveModel: env["GLADIA_LIVE_MODEL"] || "",
+    gladiaRegion: env["GLADIA_REGION"] || "",
+    gladiaPollIntervalMs: intEnv(env, "GLADIA_POLL_INTERVAL_MS", 1000),
+    gladiaPollTimeoutMs: intEnv(env, "GLADIA_POLL_TIMEOUT_MS", 5 * 60 * 1000),
   };
 }

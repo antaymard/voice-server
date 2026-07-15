@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import { serve } from "@hono/node-server";
 import { loadConfig, type Config } from "./config.ts";
 import { createApp } from "./http.ts";
+import { createGladiaClient } from "./gladia/client.ts";
 import { createMistralClients } from "./mistral.ts";
 import { attachRealtime, type RealtimeControl } from "./realtime/server.ts";
 
@@ -13,9 +14,11 @@ export type RunningServer = {
 
 export function startServer(config: Config): Promise<RunningServer> {
   const { batch, realtime } = createMistralClients(config);
+  const gladia = config.gladiaApiKey ? createGladiaClient(config) : null;
   let control: RealtimeControl | null = null;
   const app = createApp(config, {
     batch,
+    gladia,
     activeSessions: () => control?.activeSessions() ?? 0,
   });
 
@@ -30,7 +33,7 @@ export function startServer(config: Config): Promise<RunningServer> {
           }),
       });
     }) as HttpServer;
-    control = attachRealtime(server, realtime, config);
+    control = attachRealtime(server, { realtime, gladia }, config);
   });
 }
 
@@ -54,6 +57,9 @@ if (isMain) {
   }
   const running = await startServer(config);
   console.log(`voice-server listening on :${running.port}`);
+  if (!config.gladiaApiKey) {
+    console.log("[gladia] GLADIA_API_KEY not set — /v1/gladia/* endpoints are disabled (503)");
+  }
 
   let closing = false;
   const onSignal = (signal: string): void => {
