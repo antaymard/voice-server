@@ -127,8 +127,9 @@ not_configured`). Send `multipart/form-data` (file upload) or
 |---|---|---|
 | `file` | file | multipart only; exactly one of `file` / `audio_url` |
 | `audio_url` | string | publicly fetchable audio URL |
-| `language` | string | ISO 639-1; disables auto-detect. Omit to auto-detect |
-| `code_switching` | bool | allow several languages in the same audio |
+| `model` | `solaria-1` \| `solaria-3` | overrides `GLADIA_BULK_MODEL` for this request, see below |
+| `language` | string | ISO 639-1; disables auto-detect. Omit to auto-detect. **Required** for `solaria-3` |
+| `code_switching` | bool | allow several languages in the same audio (`solaria-1` only) |
 | `vocabulary` | strings / objects | business vocabulary biasing, see below |
 | `vocabulary_intensity` | number 0..1 | default replacement intensity |
 | `context` | string | free-text context prompt (topic, product names…) |
@@ -159,6 +160,20 @@ matching per term — in multipart put the JSON array in `vocabulary_json`:
   "context": "Daily standup of a French dev team; product names stay in English"
 }
 ```
+
+**Model** (`GLADIA_BULK_MODEL`, default `solaria-1`, override per-request with
+`model`):
+
+| | `solaria-1` (default) | `solaria-3` |
+|---|---|---|
+| Best on | clean/quiet, formal, read speech | noisy, real-world, production audio (call centers, accents) |
+| Languages | 100+, auto-detect, code-switching | exactly one of `en`/`fr`/`de`/`es`/`it` — `language` is **required**, `code_switching` rejected |
+| Live support | yes (also the realtime endpoint's model) | no, pre-recorded only |
+
+Default is `solaria-1`: it wins on clean/quiet audio (the common case) and
+keeps behavior consistent with `/v1/gladia/realtime`, which has no
+`solaria-3` equivalent. Reach for `solaria-3` only for genuinely messy
+production audio in one of its five languages.
 
 Response (`200`, `wait=true`): `{ "id", "status": "done", "text", "languages",
 "utterances": [{ text, start, end, language, confidence, channel, speaker?,
@@ -324,7 +339,8 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `MISTRAL_BASE_URL` | no | `https://api.mistral.ai` | upstream override (tests/mock) |
 | `MISTRAL_WS_URL` | no | `wss://api.mistral.ai` | upstream override (tests/mock) |
 | `GLADIA_API_KEY` | no | — | enables `/v1/gladia/*`; empty = those endpoints answer 503 |
-| `GLADIA_LIVE_MODEL` | no | — | live model override (empty = Gladia's default, solaria-1) |
+| `GLADIA_BULK_MODEL` | no | `solaria-1` | bulk model: `solaria-1` (clean/quiet, 100+ langs) or `solaria-3` (noisy, single language) |
+| `GLADIA_LIVE_MODEL` | no | — | live model override (empty = Gladia's default, solaria-1 — the only model live supports) |
 | `GLADIA_REGION` | no | — | live session region: `eu-west` or `us-west` (empty = Gladia default) |
 | `GLADIA_POLL_INTERVAL_MS` | no | `1000` | bulk: cadence of result polling |
 | `GLADIA_POLL_TIMEOUT_MS` | no | `300000` (5 min) | bulk: max wait before `504 poll_timeout` |

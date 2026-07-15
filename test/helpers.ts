@@ -23,6 +23,7 @@ export function makeConfig(overrides: Partial<Config> = {}): Config {
     mistralWsUrl: "ws://127.0.0.1:1",
     gladiaApiKey: "mock-gladia-key",
     gladiaBaseUrl: "http://127.0.0.1:1",
+    gladiaBulkModel: "solaria-1",
     gladiaLiveModel: "",
     gladiaRegion: "",
     gladiaPollIntervalMs: 10,

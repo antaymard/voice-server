@@ -81,6 +81,7 @@ test("multipart upload: uploads to Gladia, polls until done, returns transcript"
 
   const init = mock.initBodies.at(-1)!;
   assert.match(String(init["audio_url"]), /\/file\/mock-upload-/);
+  assert.equal(init["model"], "solaria-1");
   assert.equal(init["custom_vocabulary"], true);
   assert.deepEqual(init["custom_vocabulary_config"], {
     vocabulary: ["Solaria", "Voxtral"],
@@ -116,8 +117,7 @@ test("JSON body: rich vocabulary, diarization and summary map to Gladia options"
 
   const init = mock.initBodies.at(-1)!;
   assert.equal(init["audio_url"], "https://example.com/meeting.mp3");
-  assert.equal(init["language"], "fr");
-  assert.equal(init["detect_language"], false);
+  assert.deepEqual(init["language_config"], { languages: ["fr"], code_switching: false });
   assert.deepEqual(init["custom_vocabulary_config"], {
     vocabulary: [
       "Solaria",
@@ -131,6 +131,87 @@ test("JSON body: rich vocabulary, diarization and summary map to Gladia options"
   assert.equal(init["sentences"], true);
   assert.deepEqual(init["subtitles_config"], { formats: ["srt"] });
   assert.deepEqual(init["custom_spelling_config"], { spelling_dictionary: { SQL: ["sequel"] } });
+});
+
+test("model defaults to config.gladiaBulkModel and omits language_config when no language given", async () => {
+  const res = await app.request("/v1/gladia/transcribe", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ audio_url: "https://example.com/a.mp3" }),
+  });
+  assert.equal(res.status, 200);
+  const init = mock.initBodies.at(-1)!;
+  assert.equal(init["model"], "solaria-1");
+  assert.equal(init["language_config"], undefined);
+});
+
+test("model=solaria-3 with a supported single language succeeds", async () => {
+  const res = await app.request("/v1/gladia/transcribe", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ audio_url: "https://example.com/a.mp3", model: "solaria-3", language: "fr" }),
+  });
+  assert.equal(res.status, 200);
+  const init = mock.initBodies.at(-1)!;
+  assert.equal(init["model"], "solaria-3");
+  assert.deepEqual(init["language_config"], { languages: ["fr"], code_switching: false });
+});
+
+test("model=solaria-3 without a language is rejected", async () => {
+  const res = await app.request("/v1/gladia/transcribe", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ audio_url: "https://example.com/a.mp3", model: "solaria-3" }),
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error.message, /requires a single `language`/);
+});
+
+test("model=solaria-3 with code_switching is rejected", async () => {
+  const res = await app.request("/v1/gladia/transcribe", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({
+      audio_url: "https://example.com/a.mp3",
+      model: "solaria-3",
+      language: "fr",
+      code_switching: true,
+    }),
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error.message, /does not support `code_switching`/);
+});
+
+test("model=solaria-3 with an unsupported language is rejected", async () => {
+  const res = await app.request("/v1/gladia/transcribe", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ audio_url: "https://example.com/a.mp3", model: "solaria-3", language: "ja" }),
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error.message, /only supports language one of/);
+});
+
+test("per-request model overrides the server default", async () => {
+  const solariaOneApp = buildApp("mock-gladia-key", { gladiaBulkModel: "solaria-3" });
+  const res = await solariaOneApp.request("/v1/gladia/transcribe", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ audio_url: "https://example.com/a.mp3", model: "solaria-1" }),
+  });
+  assert.equal(res.status, 200);
+  const init = mock.initBodies.at(-1)!;
+  assert.equal(init["model"], "solaria-1");
+});
+
+test("rejects an invalid model value with 400", async () => {
+  const res = await app.request("/v1/gladia/transcribe", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ audio_url: "https://example.com/a.mp3", model: "solaria-2" }),
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error.message, /Invalid `model`/);
 });
 
 test("wait=false returns 202 immediately; GET polls the job to completion", async () => {

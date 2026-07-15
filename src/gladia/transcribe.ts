@@ -16,10 +16,15 @@ import { mapGladiaError, type GladiaClient, type GladiaJob } from "./client.ts";
 
 const SUMMARY_TYPES = ["general", "bullet_points", "concise"] as const;
 const SUBTITLE_FORMATS = ["srt", "vtt"] as const;
+const BULK_MODELS = ["solaria-1", "solaria-3"] as const;
+/** solaria-3 is restricted to a single language among these (async-only, most accurate on noisy/production audio). */
+export const SOLARIA_3_LANGUAGES = ["en", "fr", "de", "es", "it"] as const;
 
 type ParsedRequest = {
   file?: { fileName: string; content: Blob };
   audioUrl?: string;
+  /** Override of `config.gladiaBulkModel` for this request. */
+  model?: (typeof BULK_MODELS)[number];
   language?: string;
   codeSwitching?: boolean;
   vocabulary: GladiaVocabularyEntry[];
@@ -62,6 +67,14 @@ function parseIntensity(value: unknown): number | undefined {
     throw new RequestError("`vocabulary_intensity` must be a number between 0 and 1");
   }
   return num;
+}
+
+function parseModel(value: unknown): (typeof BULK_MODELS)[number] | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (!(BULK_MODELS as readonly unknown[]).includes(value)) {
+    throw new RequestError(`Invalid \`model\` "${String(value)}" (use one of ${BULK_MODELS.join(", ")})`);
+  }
+  return value as (typeof BULK_MODELS)[number];
 }
 
 function parseVocabulary(value: unknown): GladiaVocabularyEntry[] {
@@ -156,6 +169,7 @@ async function parseMultipart(c: Context): Promise<ParsedRequest> {
       ? { fileName: (file instanceof File && file.name) || "audio", content: file }
       : undefined,
     audioUrl: optionalString(form.get("audio_url")),
+    model: parseModel(form.get("model")),
     language: optionalString(form.get("language")),
     codeSwitching: parseBool(form.get("code_switching")),
     vocabulary: [...plainTerms, ...richTerms],
@@ -190,6 +204,7 @@ function parseJson(body: unknown): ParsedRequest {
   }
   return {
     audioUrl: optionalString(obj["audio_url"]),
+    model: parseModel(obj["model"]),
     language: optionalString(obj["language"]),
     codeSwitching: parseBool(obj["code_switching"]),
     vocabulary: parseVocabulary(obj["vocabulary"]),
@@ -211,14 +226,25 @@ function parseJson(body: unknown): ParsedRequest {
   };
 }
 
-/** Translate our request shape into a Gladia /v2/pre-recorded init body. */
-export function buildGladiaInitBody(parsed: ParsedRequest, audioUrl: string): Record<string, unknown> {
-  const body: Record<string, unknown> = { audio_url: audioUrl };
-  if (parsed.language) {
-    body["language"] = parsed.language;
-    body["detect_language"] = false;
+/**
+ * Translate our request shape into a Gladia /v2/pre-recorded init body.
+ * `model` is the already-resolved choice (request override or
+ * `config.gladiaBulkModel`), validated by the caller.
+ */
+export function buildGladiaInitBody(
+  parsed: ParsedRequest,
+  audioUrl: string,
+  model: string,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = { audio_url: audioUrl, model };
+  // `language` / `detect_language` are deprecated by Gladia in favor of
+  // `language_config`; omitting it entirely lets Gladia auto-detect.
+  if (parsed.language || parsed.codeSwitching) {
+    body["language_config"] = {
+      ...(parsed.language ? { languages: [parsed.language] } : {}),
+      code_switching: parsed.codeSwitching ?? false,
+    };
   }
-  if (parsed.codeSwitching) body["enable_code_switching"] = true;
   if (parsed.vocabulary.length > 0) {
     body["custom_vocabulary"] = true;
     body["custom_vocabulary_config"] = {
@@ -309,6 +335,19 @@ async function pollUntilSettled(
   }
 }
 
+/** solaria-3 can't auto-detect or switch languages: this validates the request can satisfy it. */
+function validateModelConstraints(model: string, parsed: ParsedRequest): string | null {
+  if (model !== "solaria-3") return null;
+  if (parsed.codeSwitching) return "`model=solaria-3` does not support `code_switching`";
+  if (!parsed.language) {
+    return `\`model=solaria-3\` requires a single \`language\` (one of: ${SOLARIA_3_LANGUAGES.join(", ")})`;
+  }
+  if (!(SOLARIA_3_LANGUAGES as readonly string[]).includes(parsed.language)) {
+    return `\`model=solaria-3\` only supports language one of: ${SOLARIA_3_LANGUAGES.join(", ")} (got "${parsed.language}")`;
+  }
+  return null;
+}
+
 const notConfigured = (c: Context): Response =>
   c.json(
     {
@@ -347,11 +386,15 @@ export function createGladiaTranscribeHandler(gladia: GladiaClient | null, confi
       return badRequest("Provide either `file` or `audio_url`, not both");
     }
 
+    const model = parsed.model ?? config.gladiaBulkModel;
+    const modelError = validateModelConstraints(model, parsed);
+    if (modelError) return badRequest(modelError);
+
     try {
       const audioUrl = parsed.file
         ? await gladia.upload(parsed.file.fileName, parsed.file.content)
         : (parsed.audioUrl as string);
-      const id = await gladia.initTranscription(buildGladiaInitBody(parsed, audioUrl));
+      const id = await gladia.initTranscription(buildGladiaInitBody(parsed, audioUrl, model));
 
       if (!parsed.wait) {
         return c.json({ id, status: "queued" }, 202);
