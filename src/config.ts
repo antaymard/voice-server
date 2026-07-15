@@ -24,6 +24,16 @@ export type Config = {
   defaultTargetDelayMs: number;
   mistralBaseUrl: string;
   mistralWsUrl: string;
+  /** Gladia API key; "" disables the /v1/gladia/* endpoints. */
+  gladiaApiKey: string;
+  gladiaBaseUrl: string;
+  /** Live model override, or "" to let Gladia pick its default (solaria-1). */
+  gladiaLiveModel: string;
+  /** Region for live sessions ("eu-west", "us-west"), or "" for Gladia's default. */
+  gladiaRegion: string;
+  /** Bulk transcription polling cadence and cap. */
+  gladiaPollIntervalMs: number;
+  gladiaPollTimeoutMs: number;
 };
 
 function intEnv(env: Record<string, string | undefined>, name: string, fallback: number): number {
@@ -85,5 +95,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     defaultTargetDelayMs: intEnv(env, "DEFAULT_TARGET_DELAY_MS", 480),
     mistralBaseUrl: env["MISTRAL_BASE_URL"] || "https://api.mistral.ai",
     mistralWsUrl: env["MISTRAL_WS_URL"] || "wss://api.mistral.ai",
+    gladiaApiKey: env["GLADIA_API_KEY"] || "",
+    gladiaBaseUrl: (env["GLADIA_BASE_URL"] || "https://api.gladia.io").replace(/\/$/, ""),
+    gladiaLiveModel: env["GLADIA_LIVE_MODEL"] || "",
+    gladiaRegion: env["GLADIA_REGION"] || "",
+    gladiaPollIntervalMs: intEnv(env, "GLADIA_POLL_INTERVAL_MS", 1000),
+    gladiaPollTimeoutMs: intEnv(env, "GLADIA_POLL_TIMEOUT_MS", 5 * 60 * 1000),
   };
 }

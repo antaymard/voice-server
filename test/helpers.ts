@@ -21,6 +21,12 @@ export function makeConfig(overrides: Partial<Config> = {}): Config {
     defaultTargetDelayMs: 480,
     mistralBaseUrl: "http://127.0.0.1:1",
     mistralWsUrl: "ws://127.0.0.1:1",
+    gladiaApiKey: "mock-gladia-key",
+    gladiaBaseUrl: "http://127.0.0.1:1",
+    gladiaLiveModel: "",
+    gladiaRegion: "",
+    gladiaPollIntervalMs: 10,
+    gladiaPollTimeoutMs: 3000,
     ...overrides,
   };
 }

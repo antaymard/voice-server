@@ -1,7 +1,8 @@
 # voice-server
 
 Minimal speech-to-text backend for React apps, powered by the
-[Mistral (Voxtral)](https://docs.mistral.ai/studio-api/audio/speech_to_text) API.
+[Mistral (Voxtral)](https://docs.mistral.ai/studio-api/audio/speech_to_text) API,
+with optional [Gladia](https://docs.gladia.io)-backed alternatives.
 
 - **Realtime**: browser streams mic audio over a WebSocket, the server bridges
   it to Mistral's realtime transcription and streams text deltas back
@@ -10,8 +11,13 @@ Minimal speech-to-text backend for React apps, powered by the
   back as JSON.
 - **Text to speech**: POST text, stream back raw audio (Mistral Voxtral TTS),
   latency-tuned (`pcm` streaming for the fastest time-to-first-audio).
+- **Gladia alternatives** (`/v1/gladia/*`, opt-in via `GLADIA_API_KEY`):
+  live and bulk STT with business vocabulary biasing, context prompts,
+  speaker-count-aware diarization, summaries/chapters/subtitles, and async
+  jobs with callbacks. Mistral endpoints are untouched — apps migrate (or
+  not) one call site at a time.
 - One shared token for all your apps + an origin allowlist; your
-  `MISTRAL_API_KEY` never leaves the server.
+  `MISTRAL_API_KEY`/`GLADIA_API_KEY` never leave the server.
 - Ships a copyable **React kit** (`client/`) — mic capture worklet,
   `useRealtimeTranscription` hook, `transcribeFile` helper — and a built-in
   demo page.
@@ -109,6 +115,71 @@ end-to-end from Mistral, vs ~3 s for `mp3`, which is encoded before it streams).
 Pick `pcm` for live playback and `mp3`/`opus` when you want a self-describing
 file you can drop straight into an `<audio>` element.
 
+### `POST /v1/gladia/transcribe` — bulk transcription (Gladia)
+
+Same job as `/v1/transcribe`, backed by [Gladia](https://docs.gladia.io)
+instead of Mistral, and deliberately **not** API-compatible: it exposes what
+Gladia does better. Requires `GLADIA_API_KEY` (otherwise `503
+not_configured`). Send `multipart/form-data` (file upload) or
+`application/json` (hosted `audio_url`):
+
+| Field | Type | Notes |
+|---|---|---|
+| `file` | file | multipart only; exactly one of `file` / `audio_url` |
+| `audio_url` | string | publicly fetchable audio URL |
+| `language` | string | ISO 639-1; disables auto-detect. Omit to auto-detect |
+| `code_switching` | bool | allow several languages in the same audio |
+| `vocabulary` | strings / objects | business vocabulary biasing, see below |
+| `vocabulary_intensity` | number 0..1 | default replacement intensity |
+| `context` | string | free-text context prompt (topic, product names…) |
+| `diarization` | bool | label speakers |
+| `speakers` / `min_speakers` / `max_speakers` | int | speaker-count hints for diarization |
+| `spelling` | object | exact spelling fixes: `{ "SQL": ["sequel"] }` (JSON body; `spelling_json` in multipart) |
+| `sentences` | bool | sentence-level segmentation in the result |
+| `subtitles` | `srt`, `vtt` | comma list / array; adds subtitle renders |
+| `summarize` | bool or `general` \| `bullet_points` \| `concise` | add a summary |
+| `chapters` | bool | chapterization |
+| `entities` | bool | named-entity recognition |
+| `callback_url` | string | Gladia POSTs the finished result there |
+| `metadata` | object | JSON body only; echoed back by Gladia (correlate callbacks) |
+| `wait` | bool, default `true` | `false` -> `202 {id}` immediately, poll the GET below |
+
+**Vocabulary** is the headline feature: it phonetically biases transcription
+toward your domain terms. Plain strings work (`-F "vocabulary=Solaria,Voxtral"`
+in multipart, `"vocabulary": ["Solaria"]` in JSON), and the object form tunes
+matching per term — in multipart put the JSON array in `vocabulary_json`:
+
+```json
+{
+  "audio_url": "https://example.com/standup.mp3",
+  "vocabulary": [
+    "Kubernetes",
+    { "value": "Salesforce", "pronunciations": ["sell force"], "intensity": 0.5, "language": "en" }
+  ],
+  "context": "Daily standup of a French dev team; product names stay in English"
+}
+```
+
+Response (`200`, `wait=true`): `{ "id", "status": "done", "text", "languages",
+"utterances": [{ text, start, end, language, confidence, channel, speaker?,
+words }], "metadata", ...add-ons }` — `summarization`, `chapters`, `entities`,
+`sentences`, `subtitles` appear when requested. Gladia processes async
+server-side; this endpoint polls for you (`GLADIA_POLL_*`) and returns `504
+poll_timeout` (with the job id) if the audio outlasts the budget.
+
+### `GET /v1/gladia/transcribe/:id` — poll an async job
+
+For `wait=false` (or after a `poll_timeout`): returns the same envelope with
+`status` `queued` | `processing` | `done` | `error`. Unknown ids give `404`.
+
+```bash
+curl -X POST https://your-server/v1/gladia/transcribe \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
+  -F file=@meeting.mp3 -F "vocabulary=Solaria,Voxtral" -F wait=false
+# -> 202 { "id": "...", "status": "queued" }
+curl https://your-server/v1/gladia/transcribe/<id> -H "Authorization: Bearer $AUTH_TOKEN"
+```
+
 ### `GET /healthz`
 
 No auth. `{ "ok": true, "uptime": 123, "activeSessions": 0 }`.
@@ -158,6 +229,59 @@ does not support `diarize`. The server pings every 30 s; sessions are capped
 by `MAX_SESSION_MS` (a graceful finalize is attempted first) and reaped after
 `IDLE_TIMEOUT_MS` without client frames.
 
+## Gladia realtime WebSocket — `GET /v1/gladia/realtime`
+
+The Gladia-backed alternative to `/v1/realtime` (requires `GLADIA_API_KEY`,
+otherwise the upgrade is rejected with `503`). Same transport and auth
+(`?token=`, origin allowlist, binary PCM s16le mono frames), **different
+protocol** — Gladia transcribes utterance-by-utterance with voice-activity
+endpointing instead of a rolling delta stream, and accepts per-session
+options Mistral has no equivalent for. Shared types live in
+[`client/src/gladiaProtocol.ts`](client/src/gladiaProtocol.ts).
+
+First frame (text), everything optional:
+
+```json
+{
+  "type": "start",
+  "sampleRate": 16000,
+  "languages": ["fr", "en"],
+  "codeSwitching": true,
+  "vocabulary": ["Solaria", { "value": "Salesforce", "pronunciations": ["sell force"] }],
+  "vocabularyIntensity": 0.5,
+  "endpointing": 0.05,
+  "maxDurationWithoutEndpointing": 15,
+  "audioEnhancer": false,
+  "partials": true
+}
+```
+
+- `sampleRate` ∈ {8000, 16000, 32000, 44100, 48000} (note: 32 kHz yes,
+  22.05 kHz no — this differs from the Mistral endpoint).
+- `languages`: none = auto-detect, one = forced, several = detection
+  restricted to the list (+ `codeSwitching` to switch mid-conversation).
+- `vocabulary`: same biasing as the bulk endpoint, applied live.
+- `endpointing` / `maxDurationWithoutEndpointing`: seconds of silence that
+  finalize an utterance / hard cap without silence (clamped to Gladia's
+  bounds).
+- `partials`: set `false` if you only render committed text.
+
+Then binary PCM frames; `{"type":"stop"}` finalizes (no `flush` — endpointing
+plays that role). Server → client events:
+
+| Event | Payload | Meaning |
+|---|---|---|
+| `ready` | `sessionId, sampleRate, partials` | session is live, send audio |
+| `partial` | `text, language?, confidence?` | hypothesis for the **current** utterance; each one **replaces** the previous (render as ephemeral text) |
+| `utterance` | `text, start, end, language?, confidence?, words?` | committed utterance, never rewritten |
+| `done` | `text, utterances[]` | full-session transcript after `stop`, then close `1000` |
+| `error` | `code, message` | same codes as `/v1/realtime`, then close |
+
+Close codes and error codes are shared with the Mistral endpoint. The final
+`done.text` comes from Gladia's post-processing pass (slightly cleaner than
+the concatenated utterances); if that pass fails to report, the server falls
+back to the utterances it already relayed.
+
 ## React usage
 
 See [`client/README.md`](client/README.md). Short version:
@@ -199,6 +323,12 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `DEFAULT_TARGET_DELAY_MS` | no | `480` | default latency/accuracy tradeoff |
 | `MISTRAL_BASE_URL` | no | `https://api.mistral.ai` | upstream override (tests/mock) |
 | `MISTRAL_WS_URL` | no | `wss://api.mistral.ai` | upstream override (tests/mock) |
+| `GLADIA_API_KEY` | no | — | enables `/v1/gladia/*`; empty = those endpoints answer 503 |
+| `GLADIA_LIVE_MODEL` | no | — | live model override (empty = Gladia's default, solaria-1) |
+| `GLADIA_REGION` | no | — | live session region: `eu-west` or `us-west` (empty = Gladia default) |
+| `GLADIA_POLL_INTERVAL_MS` | no | `1000` | bulk: cadence of result polling |
+| `GLADIA_POLL_TIMEOUT_MS` | no | `300000` (5 min) | bulk: max wait before `504 poll_timeout` |
+| `GLADIA_BASE_URL` | no | `https://api.gladia.io` | upstream override (tests/mock) |
 
 ## Deploying to Railway
 
@@ -231,18 +361,25 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 
 ```bash
 npm run dev        # watch mode, reads .env
-npm test           # protocol + auth + batch + full WS bridge against the mock
+npm test           # protocol + auth + batch + full WS bridges against the mocks
 npm run typecheck
 npm run build && npm start
 ```
 
-The test suite needs no Mistral key: `test/mock-mistral.ts` emulates both the
-batch endpoint and the realtime WebSocket.
+The test suite needs no API keys: `test/mock-mistral.ts` emulates the Mistral
+batch endpoint and realtime WebSocket, `test/mock-gladia.ts` the Gladia
+upload/pre-recorded/live surface (`npm run mock:gladia` to run it standalone
+on :9098 with `GLADIA_API_KEY=any GLADIA_BASE_URL=http://127.0.0.1:9098`).
 
 ## Known limitations
 
-- Realtime: language is auto-detected (no hint parameter upstream);
-  `diarize` is batch-only.
+- Realtime (Mistral): language is auto-detected (no hint parameter upstream);
+  `diarize` is batch-only. The Gladia realtime endpoint accepts language
+  hints and vocabulary if you need them live.
+- Gladia bulk: `sentiment_analysis`, `moderation`, translation and
+  `audio_to_llm` add-ons are not exposed yet (easy to add in
+  `src/gladia/transcribe.ts` if needed); the demo page only exercises the
+  Mistral endpoints.
 - Bulk: `timestamps` cannot be combined with `language` (current Mistral
   limitation).
 - `@mistralai/mistralai` is pinned to exactly `2.2.5`: the published SDK does

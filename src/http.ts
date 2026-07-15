@@ -7,9 +7,13 @@ import { bearerToken, isOriginAllowed, safeEqual } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { createTranscribeHandler } from "./transcribe.ts";
 import { createSynthesizeHandler } from "./synthesize.ts";
+import type { GladiaClient } from "./gladia/client.ts";
+import { createGladiaResultHandler, createGladiaTranscribeHandler } from "./gladia/transcribe.ts";
 
 export type AppDeps = {
   batch: Mistral;
+  /** null when GLADIA_API_KEY is not configured (endpoints answer 503). */
+  gladia: GladiaClient | null;
   activeSessions: () => number;
 };
 
@@ -57,23 +61,26 @@ export function createApp(config: Config, deps: AppDeps): Hono {
     await next();
   });
 
-  app.post(
-    "/v1/transcribe",
-    bodyLimit({
-      maxSize: config.maxUploadBytes,
-      onError: (c) =>
-        c.json(
-          {
-            error: {
-              code: "payload_too_large",
-              message: `Request body exceeds ${config.maxUploadBytes} bytes`,
-            },
+  const uploadLimit = bodyLimit({
+    maxSize: config.maxUploadBytes,
+    onError: (c) =>
+      c.json(
+        {
+          error: {
+            code: "payload_too_large",
+            message: `Request body exceeds ${config.maxUploadBytes} bytes`,
           },
-          413,
-        ),
-    }),
-    createTranscribeHandler(deps.batch, config),
-  );
+        },
+        413,
+      ),
+  });
+
+  app.post("/v1/transcribe", uploadLimit, createTranscribeHandler(deps.batch, config));
+
+  // Gladia-backed alternatives (business vocabulary, diarization config,
+  // async jobs, …). Mistral endpoints above stay untouched.
+  app.post("/v1/gladia/transcribe", uploadLimit, createGladiaTranscribeHandler(deps.gladia, config));
+  app.get("/v1/gladia/transcribe/:id", createGladiaResultHandler(deps.gladia));
 
   app.post("/v1/speak", createSynthesizeHandler(deps.batch, config));
 
