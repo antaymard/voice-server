@@ -4,6 +4,7 @@ import { serve } from "@hono/node-server";
 import { loadConfig, type Config } from "./config.ts";
 import { createApp } from "./http.ts";
 import { createGladiaClient } from "./gladia/client.ts";
+import { createMediaJobs } from "./media/jobs.ts";
 import { createMistralClients } from "./mistral.ts";
 import { attachRealtime, type RealtimeControl } from "./realtime/server.ts";
 
@@ -15,11 +16,13 @@ export type RunningServer = {
 export function startServer(config: Config): Promise<RunningServer> {
   const { batch, realtime } = createMistralClients(config);
   const gladia = config.gladiaApiKey ? createGladiaClient(config) : null;
+  const media = createMediaJobs(config);
   let control: RealtimeControl | null = null;
   const app = createApp(config, {
     batch,
     gladia,
     activeSessions: () => control?.activeSessions() ?? 0,
+    media,
   });
 
   return new Promise((resolve) => {
@@ -29,7 +32,8 @@ export function startServer(config: Config): Promise<RunningServer> {
         close: () =>
           new Promise<void>((done) => {
             control?.shutdown();
-            server.close(() => done());
+            // Kills running ffmpeg processes and aborts downloads.
+            void media.shutdown().finally(() => server.close(() => done()));
           }),
       });
     }) as HttpServer;
@@ -59,6 +63,9 @@ if (isMain) {
   console.log(`voice-server listening on :${running.port}`);
   if (!config.gladiaApiKey) {
     console.log("[gladia] GLADIA_API_KEY not set — /v1/gladia/* endpoints are disabled (503)");
+  }
+  if (config.mediaAllowedSourceHosts.length === 0) {
+    console.log("[media] MEDIA_ALLOWED_SOURCE_HOSTS not set — /v1/media/* endpoints are disabled (503)");
   }
 
   let closing = false;

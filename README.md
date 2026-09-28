@@ -16,6 +16,11 @@ with optional [Gladia](https://docs.gladia.io)-backed alternatives.
   speaker-count-aware diarization, summaries/chapters/subtitles, and async
   jobs with callbacks. Mistral endpoints are untouched — apps migrate (or
   not) one call site at a time.
+- **Long-file preparation** (`/v1/media/audio-parts`, opt-in via
+  `MEDIA_ALLOWED_SOURCE_HOSTS`): extracts the audio track of a long
+  recording (audio or video, up to hours), re-encodes it to light mono mp3/ogg
+  and splits it into ~20 min parts cut in silences, so a 25 MB-capped STT
+  can transcribe it part by part. Pure media processing (ffmpeg) — no STT.
 - One shared token for all your apps + an origin allowlist; your
   `MISTRAL_API_KEY`/`GLADIA_API_KEY` never leave the server.
 - Ships a copyable **React kit** (`client/`) — mic capture worklet,
@@ -195,9 +200,90 @@ curl -X POST https://your-server/v1/gladia/transcribe \
 curl https://your-server/v1/gladia/transcribe/<id> -H "Authorization: Bearer $AUTH_TOKEN"
 ```
 
+### `POST /v1/media/audio-parts` — prepare a long file for transcription
+
+Media processing only: **no STT call, no provider key, no storage write**. The
+server downloads a public file, extracts its audio track (audio *or* video
+sources: m4a/AAC, webm/opus, mp4, mov, …), re-encodes it to mono 16 kHz
+(what Whisper-style models consume anyway) and splits it into parts of about
+`part_seconds`, cutting in silences when one is found within ±60 s of the
+target (hard cut otherwise). The caller transcribes each part with its own
+STT, shifts the timestamps by the part's `start_sec`, and concatenates.
+
+Disabled (`503 media_disabled`) unless `MEDIA_ALLOWED_SOURCE_HOSTS` is set and
+`ffmpeg`/`ffprobe` are on `PATH` (the Docker image ships them). Jobs are
+async, in the style of the Gladia `wait=false` flow:
+
+| Route | Result |
+|---|---|
+| `POST /v1/media/audio-parts` | `202 { "job_id", "status": "queued" }` |
+| `GET /v1/media/audio-parts/:id` | job state + the parts ready so far |
+| `GET /v1/media/audio-parts/:id/parts/:index` | the part's bytes (streamed, exact `Content-Length`, `Cache-Control: no-store`) |
+| `DELETE /v1/media/audio-parts/:id` | `204`, always (idempotent): cancels (kills ffmpeg, aborts the download) and deletes the files |
+
+Request body (`application/json`):
+
+| Field | Default | Constraints |
+|---|---|---|
+| `source_url` | — (required) | `https:` only; host must be in `MEDIA_ALLOWED_SOURCE_HOSTS` (SSRF guard); redirects are refused |
+| `part_seconds` | `1200` | integer, 300–3600: target part length |
+| `format` | `"mp3"` | `"mp3"` (libmp3lame 32 kbit/s, `audio/mpeg`, ≈14 MB/h — accepted by every Whisper provider) or `"ogg"` (libopus 24 kbit/s, `audio/ogg`, ≈11 MB/h) |
+
+Errors on `POST`: `400 bad_request` (bad JSON/field), `403
+source_not_allowed`, `429 busy` (`MEDIA_MAX_CONCURRENT_JOBS` jobs already
+queued or running — there is no queue, retry later), `503 media_disabled`.
+
+```bash
+curl -X POST https://your-server/v1/media/audio-parts \
+  -H "Authorization: Bearer $AUTH_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "source_url": "https://files.example.com/u123/interview.m4a" }'
+# -> 202 { "job_id": "3f0c…", "status": "queued" }
+
+curl https://your-server/v1/media/audio-parts/3f0c… -H "Authorization: Bearer $AUTH_TOKEN"
+# -> { "job_id": "3f0c…", "status": "splitting", "duration_sec": 25211.84,
+#      "has_video": false, "total_parts": 21,
+#      "parts": [ { "index": 0, "start_sec": 0, "end_sec": 1193.42, "duration_sec": 1193.42,
+#                   "bytes": 4773680, "content_type": "audio/mpeg" } ],
+#      "error": null, "created_at": "…", "expires_at": "…" }
+
+curl -o part-0.mp3 https://your-server/v1/media/audio-parts/3f0c…/parts/0 \
+  -H "Authorization: Bearer $AUTH_TOKEN"
+curl -X DELETE https://your-server/v1/media/audio-parts/3f0c… -H "Authorization: Bearer $AUTH_TOKEN"
+```
+
+`status` goes `queued` → `downloading` → `probing` → `analyzing` →
+`splitting` → `done` (or `error`). Rules the caller can rely on:
+
+- `duration_sec`, `has_video` (true for real video tracks, not album art) and
+  `total_parts` are `null` until known; `total_parts` is set from `splitting`.
+- `parts` only lists parts fully written to disk, sorted by `index`, and grows
+  during `splitting`: start transcribing part 0 while the rest is produced.
+  A part not ready yet answers `404` on download.
+- `parts[0].start_sec === 0`, `parts[i].start_sec === parts[i-1].end_sec`,
+  indexes are consecutive from 0, and the last `end_sec` equals
+  `duration_sec`. All seconds are floats rounded to the millisecond; a part's
+  `duration_sec` is `end_sec - start_sec` (the computed cut, which is what
+  timestamp shifting needs).
+- `error` is non-null only when `status === "error"`:
+  `{ "code", "message" }` with `code` one of `source_fetch_failed` (non-2xx,
+  network error, redirect), `source_too_large`, `unreadable_media`,
+  `no_audio_stream`, `too_long`, `ffmpeg_failed` (message ends with ffmpeg's
+  stderr), `part_too_large` (>24 MB — a misconfiguration guard),
+  `cancelled`, `internal_error`. The files of a failed job are deleted
+  immediately; the job itself stays readable until `expires_at`.
+- Jobs expire `MEDIA_JOB_TTL_MS` after creation (files + state purged every
+  minute). Call `DELETE` when you are done, success or failure; the TTL is
+  only a safety net. Unknown/expired ids give `404 not_found`.
+
+**Single replica only.** Jobs live in process memory and their files on the
+container's local disk, so every call for a job must reach the same instance
+(Railway's default single replica). Scaling out would need shared storage.
+The work dir is purged at startup: jobs in flight during a redeploy are lost
+(`404`), and the caller should retry.
+
 ### `GET /healthz`
 
-No auth. `{ "ok": true, "uptime": 123, "activeSessions": 0 }`.
+No auth. `{ "ok": true, "uptime": 123, "activeSessions": 0, "media": { "enabled": true, "activeJobs": 0 } }`.
 
 ### `GET /`
 
@@ -345,6 +431,17 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `GLADIA_POLL_INTERVAL_MS` | no | `1000` | bulk: cadence of result polling |
 | `GLADIA_POLL_TIMEOUT_MS` | no | `300000` (5 min) | bulk: max wait before `504 poll_timeout` |
 | `GLADIA_BASE_URL` | no | `https://api.gladia.io` | upstream override (tests/mock) |
+| `MEDIA_ALLOWED_SOURCE_HOSTS` | no | — | comma-separated hosts `source_url` may use (e.g. your R2 public host `files.example.com`); empty = `/v1/media/*` answer 503 |
+| `MEDIA_WORK_DIR` | no | `<os tmpdir>/media-jobs` | per-job scratch dirs (purged at startup) |
+| `MEDIA_MAX_SOURCE_BYTES` | no | `629145600` (600 MB) | max source size (checked on `Content-Length` and while streaming) |
+| `MEDIA_MAX_DURATION_SEC` | no | `28800` (8 h) | max source duration |
+| `MEDIA_MAX_CONCURRENT_JOBS` | no | `2` | active jobs (queued or running); beyond → `429 busy` |
+| `MEDIA_JOB_TTL_MS` | no | `3600000` (1 h) | job lifetime (state + files) |
+| `MEDIA_FFMPEG_TIMEOUT_MS` | no | `900000` (15 min) | timeout of each ffmpeg/ffprobe run (SIGKILL) |
+| `MEDIA_SILENCE_NOISE_DB` | no | `-35` | silence threshold in dB (negative integer) |
+| `MEDIA_SILENCE_MIN_SEC` | no | `0.4` | minimum silence length, in seconds |
+| `MEDIA_SILENCE_WINDOW_SEC` | no | `60` | half-width of the window searched for a silence around each target cut |
+| `MEDIA_MIN_LAST_PART_SEC` | no | `30` | a shorter trailing part is merged into the previous one |
 
 ## Deploying to Railway
 
@@ -355,6 +452,13 @@ new Audio(URL.createObjectURL(await res.blob())).play();
    variables. Railway injects `PORT`.
 3. Deploy; WebSockets work through Railway's proxy out of the box.
 4. In each React app, set the server URL + token and use the kit.
+5. Optional, for `/v1/media/audio-parts`: set `MEDIA_ALLOWED_SOURCE_HOSTS`
+   to the host of your public file storage (e.g. the host of `R2_PUBLIC_URL`).
+   The image already contains ffmpeg. Keep a **single replica**, give the
+   service at least 1 vCPU / 1 GB RAM, and count on ephemeral disk for
+   `MEDIA_MAX_CONCURRENT_JOBS × (source + parts)` — about 1.5 GB worst case
+   with the defaults. If ffmpeg were missing, the server still boots (live STT
+   is unaffected) and logs a warning; `/healthz` reports `media.enabled`.
 
 > **Healthcheck stuck on "service unavailable"?** Open the **Deploy Logs** tab
 > (not the Healthcheck log) to see why the container never came up. Two common
@@ -377,7 +481,8 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 
 ```bash
 npm run dev        # watch mode, reads .env
-npm test           # protocol + auth + batch + full WS bridges against the mocks
+npm test           # protocol + auth + batch + full WS bridges against the mocks,
+                   # plus media e2e (skipped when ffmpeg is not installed)
 npm run typecheck
 npm run build && npm start
 ```

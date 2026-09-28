@@ -1,3 +1,5 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Config } from "../src/config.ts";
 
 export const TEST_TOKEN = "test-token-0123456789abcdef0123456789abcdef";
@@ -28,6 +30,19 @@ export function makeConfig(overrides: Partial<Config> = {}): Config {
     gladiaRegion: "",
     gladiaPollIntervalMs: 10,
     gladiaPollTimeoutMs: 3000,
+    // Media module disabled by default; tests opt in with an allowlist.
+    // Test files run in parallel processes, so each gets its own work dir.
+    mediaAllowedSourceHosts: [],
+    mediaWorkDir: join(tmpdir(), `media-jobs-test-${process.pid}`),
+    mediaMaxSourceBytes: 600 * 1024 * 1024,
+    mediaMaxDurationSec: 8 * 3600,
+    mediaMaxConcurrentJobs: 2,
+    mediaJobTtlMs: 60 * 60 * 1000,
+    mediaFfmpegTimeoutMs: 60 * 1000,
+    mediaSilenceNoiseDb: -35,
+    mediaSilenceMinSec: 0.4,
+    mediaSilenceWindowSec: 60,
+    mediaMinLastPartSec: 30,
     ...overrides,
   };
 }

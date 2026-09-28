@@ -9,6 +9,14 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:22-slim
 ENV NODE_ENV=production
+# ffmpeg/ffprobe power /v1/media/* (audio extraction, silence detection,
+# re-encoding). Debian's build ships libmp3lame and libopus; fail the build
+# if that ever changes.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && ffmpeg -hide_banner -encoders | grep -q libmp3lame \
+ && ffmpeg -hide_banner -encoders | grep -q libopus
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
