@@ -9,12 +9,16 @@ import { createTranscribeHandler } from "./transcribe.ts";
 import { createSynthesizeHandler } from "./synthesize.ts";
 import type { GladiaClient } from "./gladia/client.ts";
 import { createGladiaResultHandler, createGladiaTranscribeHandler } from "./gladia/transcribe.ts";
+import type { MediaJobs } from "./media/jobs.ts";
+import { registerMediaRoutes } from "./media/routes.ts";
 
 export type AppDeps = {
   batch: Mistral;
   /** null when GLADIA_API_KEY is not configured (endpoints answer 503). */
   gladia: GladiaClient | null;
   activeSessions: () => number;
+  /** Audio-parts jobs; absent or disabled -> /v1/media/* answer 503. */
+  media?: MediaJobs | null;
 };
 
 export function createApp(config: Config, deps: AppDeps): Hono {
@@ -34,7 +38,12 @@ export function createApp(config: Config, deps: AppDeps): Hono {
   );
 
   app.get("/healthz", (c) =>
-    c.json({ ok: true, uptime: Math.round(process.uptime()), activeSessions: deps.activeSessions() }),
+    c.json({
+      ok: true,
+      uptime: Math.round(process.uptime()),
+      activeSessions: deps.activeSessions(),
+      media: { enabled: deps.media?.enabled ?? false, activeJobs: deps.media?.activeCount() ?? 0 },
+    }),
   );
 
   app.use(
@@ -47,7 +56,7 @@ export function createApp(config: Config, deps: AppDeps): Hono {
         console.warn(`[http] blocked CORS origin "${origin}" (not in ALLOWED_ORIGINS)`);
         return "";
       },
-      allowMethods: ["GET", "POST", "OPTIONS"],
+      allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
       allowHeaders: ["Authorization", "Content-Type"],
       maxAge: 86400,
     }),
@@ -83,6 +92,9 @@ export function createApp(config: Config, deps: AppDeps): Hono {
   app.get("/v1/gladia/transcribe/:id", createGladiaResultHandler(deps.gladia));
 
   app.post("/v1/speak", createSynthesizeHandler(deps.batch, config));
+
+  // Long-file preparation for transcription (ffmpeg; no STT here).
+  registerMediaRoutes(app, config, deps.media ?? null);
 
   // Demo page (mic + file upload). Static files are public; API calls made
   // from the page still require the token.
