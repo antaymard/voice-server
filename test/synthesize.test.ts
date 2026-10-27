@@ -135,3 +135,62 @@ test("passes through upstream 400", async () => {
   const body = await res.json();
   assert.equal(body.error.code, "bad_request");
 });
+
+test("defaults to Voxtral TTS 3 and forwards the new Voxtral 3 options", async () => {
+  const res = await speak({
+    input: "[emotion=happy]We passed the audit!",
+    voice: "voice_592",
+    expressiveness: 1.5,
+    phoneme_hints: { tomato: ["t", "ə", "m", "ɑ", "t", "oʊ"] },
+    conversation_history: [
+      { role: "user", audio: "VVNFUg==" },
+      { role: "assistant", text: "Hi!", audio: "QVNTVA==" },
+      { role: "user", audio: "VVNFUjI=" },
+    ],
+  });
+  assert.equal(res.status, 200);
+  await res.arrayBuffer();
+  const sent = mock.received.speech!;
+  assert.equal(sent["model"], "voxtral-mini-tts-3-0");
+  assert.equal(sent["input"], "[emotion=happy]We passed the audit!");
+  assert.equal(sent["voice_id"], "voice_592");
+  assert.equal(sent["expressiveness"], 1.5);
+  assert.deepEqual(sent["phoneme_hints"], { tomato: ["t", "ə", "m", "ɑ", "t", "oʊ"] });
+  assert.deepEqual(sent["conversation_history"], [
+    { role: "user", audio: { data: "VVNFUg==" } },
+    { role: "assistant", text: "Hi!", audio: { data: "QVNTVA==" } },
+    { role: "user", audio: { data: "VVNFUjI=" } },
+  ]);
+});
+
+test("rejects invalid Voxtral 3 options with 400 before calling Mistral", async () => {
+  const cases: Array<[Record<string, unknown>, RegExp]> = [
+    [{ expressiveness: 0.5 }, /expressiveness/],
+    [{ expressiveness: "high" }, /expressiveness/],
+    [{ phoneme_hints: { tomato: ["tomato"] } }, /Unsupported phoneme/],
+    [{ phoneme_hints: { tomato: [] } }, /non-empty array/],
+    [{ phoneme_hints: ["t"] }, /phoneme_hints/],
+    [{ conversation_history: [] }, /non-empty array/],
+    [{ conversation_history: [{ role: "system", audio: "QQ==" }] }, /role/],
+    [{ conversation_history: [{ role: "assistant", audio: "QQ==" }] }, /text/],
+    [{ conversation_history: [{ role: "user" }] }, /audio/],
+    [{ conversation_history: [{ role: "user", audio: "QQ==" }], ref_audio: "QQ==" }, /ref_audio/],
+  ];
+  for (const [extra, pattern] of cases) {
+    const res = await speak({ input: "hello", ...extra });
+    assert.equal(res.status, 400, JSON.stringify(extra));
+    const body = await res.json();
+    assert.equal(body.error.code, "bad_request");
+    assert.match(body.error.message, pattern);
+  }
+});
+
+test("caps the request body (base64 audio) at MAX_UPLOAD_BYTES", async () => {
+  const small = buildApp("mock-api-key", { maxUploadBytes: 64 });
+  const res = await small.request("/v1/speak", {
+    method: "POST",
+    headers: authHeader,
+    body: JSON.stringify({ input: "hello", ref_audio: "A".repeat(200) }),
+  });
+  assert.equal(res.status, 413);
+});

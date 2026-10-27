@@ -1,11 +1,19 @@
 export type SpeechFormat = "pcm" | "wav" | "mp3" | "flac" | "opus";
 
+/**
+ * One turn of a voice conversation, oldest first, used to condition how the
+ * next reply sounds. `audio` is base64 (what was actually heard/spoken).
+ */
+export type ConversationTurn =
+  | { role: "user"; audio: string }
+  | { role: "assistant"; text: string; audio: string };
+
 export type SynthesizeOptions = {
   /** Base URL of voice-server, e.g. "https://voice.example.com". */
   serverUrl: string;
   /** The server's shared AUTH_TOKEN. */
   token: string;
-  /** Preset or saved voice id. Omit to use the server default. */
+  /** Preset or saved voice id (see `listVoices`). Omit to use the server default. */
   voice?: string;
   /** Base64 audio for one-off zero-shot voice cloning (overrides `voice`). */
   refAudio?: string;
@@ -19,6 +27,22 @@ export type SynthesizeOptions = {
   model?: string;
   /** Stream the audio as it is generated (default true; lowest latency). */
   stream?: boolean;
+  /**
+   * Voxtral 3: strength of expressive delivery, 1.0-5.0. Higher values give
+   * stronger emotion at the cost of similarity to the voice.
+   */
+  expressiveness?: number;
+  /**
+   * Voxtral 3: custom pronunciation, word -> IPA phonemes (one symbol per
+   * item), e.g. `{ tomato: ["t", "ə", "m", "ɑ", "t", "oʊ"] }`.
+   */
+  phonemeHints?: Record<string, string[]>;
+  /**
+   * Voxtral 3: prior turns (alternating, ending with a `user` turn) so the
+   * reply's delivery fits the conversation. Needs a Voxtral 3 preset `voice`;
+   * not combinable with `refAudio`.
+   */
+  conversationHistory?: ConversationTurn[];
   signal?: AbortSignal;
 };
 
@@ -39,8 +63,11 @@ export class SpeechError extends Error {
  * The body streams chunk-by-chunk, so you can pipe `res.body` into the Web
  * Audio API for the lowest latency, or call `.blob()` for a one-shot clip.
  *
+ * Voxtral 3 reads inline tags in `input`: `[emotion=happy]` (34 emotions) and
+ * `[pace=slow]` (very-slow, slow, moderate, fast, very-fast). Tags are not spoken.
+ *
  * ```ts
- * const res = await synthesizeSpeech("Bonjour le monde", { serverUrl, token, format: "mp3" });
+ * const res = await synthesizeSpeech("[emotion=warm]Bonjour le monde", { serverUrl, token, format: "mp3" });
  * const url = URL.createObjectURL(await res.blob());
  * new Audio(url).play();
  * ```
@@ -63,6 +90,9 @@ export async function synthesizeSpeech(
       ...(options.format ? { format: options.format } : {}),
       ...(options.model ? { model: options.model } : {}),
       ...(options.stream === false ? { stream: false } : {}),
+      ...(options.expressiveness !== undefined ? { expressiveness: options.expressiveness } : {}),
+      ...(options.phonemeHints ? { phoneme_hints: options.phonemeHints } : {}),
+      ...(options.conversationHistory ? { conversation_history: options.conversationHistory } : {}),
     }),
     signal: options.signal,
   });

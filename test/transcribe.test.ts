@@ -96,15 +96,82 @@ test("requires exactly one of file / file_url", async () => {
   assert.equal(both.status, 400);
 });
 
-test("rejects language combined with timestamps", async () => {
+test("defaults to Voxtral Mini Transcribe 3 and forwards language with timestamps", async () => {
   const res = await app.request("/v1/transcribe", {
     method: "POST",
     headers: authHeader,
     body: audioForm({ language: "fr", timestamps: "segment" }),
   });
+  assert.equal(res.status, 200);
+  const sent = mock.received.transcription!;
+  assert.deepEqual(sent["model"], ["voxtral-mini-transcribe-3-0"]);
+  assert.deepEqual(sent["language"], ["fr"]);
+  assert.deepEqual(sent["timestamp_granularities"], ["segment"]);
+});
+
+test("per-request model override (e.g. Voxtral Small Transcribe 3)", async () => {
+  const res = await app.request("/v1/transcribe", {
+    method: "POST",
+    headers: authHeader,
+    body: audioForm({ model: "voxtral-small-transcribe-3-0" }),
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(mock.received.transcription!["model"], ["voxtral-small-transcribe-3-0"]);
+  const body = await res.json();
+  assert.equal(body.model, "voxtral-small-transcribe-3-0");
+});
+
+test("word timestamps are rejected with a Voxtral 3 hint", async () => {
+  const res = await app.request("/v1/transcribe", {
+    method: "POST",
+    headers: authHeader,
+    body: audioForm({ timestamps: "segment,word" }),
+  });
   assert.equal(res.status, 400);
   const body = await res.json();
-  assert.match(body.error.message, /language/);
+  assert.match(body.error.message, /Voxtral 3.*segment/);
+});
+
+test("diarize implies segment timestamps", async () => {
+  const res = await app.request("/v1/transcribe", {
+    method: "POST",
+    headers: authHeader,
+    body: audioForm({ diarize: "true" }),
+  });
+  assert.equal(res.status, 200);
+  const sent = mock.received.transcription!;
+  assert.deepEqual(sent["diarize"], ["true"]);
+  assert.deepEqual(sent["timestamp_granularities"], ["segment"]);
+});
+
+test("speaker reference files are forwarded as named references and imply diarize", async () => {
+  const form = audioForm();
+  form.append("speaker_reference.Alice", new Blob([new Uint8Array(16).fill(65)]), "alice.wav");
+  const res = await app.request("/v1/transcribe", { method: "POST", headers: authHeader, body: form });
+  assert.equal(res.status, 200);
+  const sent = mock.received.transcription!;
+  assert.deepEqual(sent["diarize"], ["true"]);
+  // The SDK serializes the map as JSON in a single multipart field.
+  const refs = JSON.parse(sent["speaker_references"]![0]!) as Record<string, string>;
+  assert.equal(refs["Alice"], Buffer.alloc(16, 65).toString("base64"));
+});
+
+test("JSON speaker_references are validated", async () => {
+  const tooMany = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`s${i}`, "QUFB"]));
+  for (const [refs, pattern] of [
+    [tooMany, /At most 8/],
+    [{ Alice: 42 }, /base64 audio strings/],
+    [["QUFB"], /base64 audio strings/],
+  ] as const) {
+    const res = await app.request("/v1/transcribe", {
+      method: "POST",
+      headers: { ...authHeader, "content-type": "application/json" },
+      body: JSON.stringify({ file_url: "https://example.com/a.mp3", speaker_references: refs }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error.message, pattern);
+  }
 });
 
 test("rejects invalid timestamps values", async () => {

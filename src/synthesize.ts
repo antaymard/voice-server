@@ -1,6 +1,7 @@
 import type { Context } from "hono";
 import type { Mistral } from "@mistralai/mistralai";
 import { CompleteAcceptEnum } from "@mistralai/mistralai/sdk/speech.js";
+import { IPAPhoneme } from "@mistralai/mistralai/models/components";
 import type { Config, SpeechFormat } from "./config.ts";
 import { SPEECH_FORMATS } from "./config.ts";
 import { mapUpstreamError } from "./transcribe.ts";
@@ -25,6 +26,10 @@ const FORMAT_HEADERS: Record<SpeechFormat, Record<string, string>> = {
   opus: { "content-type": "audio/ogg" },
 };
 
+type HistoryTurn =
+  | { role: "user"; audio: { data: string } }
+  | { role: "assistant"; text: string; audio: { data: string } };
+
 type ParsedRequest = {
   input: string;
   voice?: string;
@@ -32,9 +37,86 @@ type ParsedRequest = {
   format: SpeechFormat;
   model?: string;
   stream: boolean;
+  expressiveness?: number;
+  phonemeHints?: Record<string, IPAPhoneme[]>;
+  conversationHistory?: HistoryTurn[];
 };
 
 class RequestError extends Error {}
+
+/** Voxtral 3 documents expressiveness in [1.0, 5.0]; >= 1 trades voice similarity for delivery. */
+const MIN_EXPRESSIVENESS = 1;
+const MAX_EXPRESSIVENESS = 5;
+const PHONEMES: ReadonlySet<string> = new Set(Object.values(IPAPhoneme));
+
+function parseExpressiveness(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value < MIN_EXPRESSIVENESS ||
+    value > MAX_EXPRESSIVENESS
+  ) {
+    throw new RequestError(
+      `\`expressiveness\` must be a number between ${MIN_EXPRESSIVENESS} and ${MAX_EXPRESSIVENESS}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Checked here because the SDK validates phonemes client-side: an unknown one
+ * would otherwise surface as an opaque 502 instead of a fixable 400.
+ */
+function parsePhonemeHints(value: unknown): Record<string, IPAPhoneme[]> | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new RequestError("`phoneme_hints` must map words to arrays of IPA phonemes");
+  }
+  const hints = Object.entries(value as Record<string, unknown>);
+  if (hints.length === 0) return undefined;
+  for (const [word, phonemes] of hints) {
+    if (!Array.isArray(phonemes) || phonemes.length === 0) {
+      throw new RequestError(`\`phoneme_hints.${word}\` must be a non-empty array of phonemes`);
+    }
+    const invalid = phonemes.filter((ph) => typeof ph !== "string" || !PHONEMES.has(ph));
+    if (invalid.length > 0) {
+      throw new RequestError(
+        `Unsupported phoneme(s) for "${word}": ${invalid.map(String).join(" ")} ` +
+          `(one IPA symbol per item; supported: ${[...PHONEMES].join(" ")})`,
+      );
+    }
+  }
+  return Object.fromEntries(hints) as Record<string, IPAPhoneme[]>;
+}
+
+/**
+ * Accepts `{ role, text?, audio: "<base64>" }` turns (audio as a plain
+ * string, flatter than Mistral's `{ data }`). Ordering rules (alternating,
+ * ending with `user`) are left to Mistral, whose 4xx passes through.
+ */
+function parseConversationHistory(value: unknown): HistoryTurn[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new RequestError("`conversation_history` must be a non-empty array of turns");
+  }
+  return value.map((turn, i) => {
+    const t = (typeof turn === "object" && turn !== null ? turn : {}) as Record<string, unknown>;
+    const audio = t["audio"];
+    if (typeof audio !== "string" || !audio) {
+      throw new RequestError(`\`conversation_history[${i}].audio\` must be base64 audio`);
+    }
+    if (t["role"] === "user") return { role: "user", audio: { data: audio } };
+    if (t["role"] === "assistant") {
+      const text = t["text"];
+      if (typeof text !== "string" || !text) {
+        throw new RequestError(`\`conversation_history[${i}].text\` is required for assistant turns`);
+      }
+      return { role: "assistant", text, audio: { data: audio } };
+    }
+    throw new RequestError(`\`conversation_history[${i}].role\` must be "user" or "assistant"`);
+  });
+}
 
 function asString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null) return undefined;
@@ -68,6 +150,10 @@ function parseRequest(body: unknown, config: Config): ParsedRequest {
   // Streaming (the default) gives the lowest time-to-first-byte; opt out with
   // `stream: false` to receive the whole clip in one response.
   const stream = obj["stream"] === undefined ? true : obj["stream"] === true;
+  const conversationHistory = parseConversationHistory(obj["conversation_history"]);
+  if (conversationHistory && refAudio) {
+    throw new RequestError("`conversation_history` needs a preset `voice` and cannot be combined with `ref_audio`");
+  }
   return {
     input,
     voice,
@@ -75,6 +161,9 @@ function parseRequest(body: unknown, config: Config): ParsedRequest {
     format: parseFormat(obj["format"], config.ttsFormat),
     model,
     stream,
+    expressiveness: parseExpressiveness(obj["expressiveness"]),
+    phonemeHints: parsePhonemeHints(obj["phoneme_hints"]),
+    conversationHistory,
   };
 }
 
@@ -98,6 +187,9 @@ export function createSynthesizeHandler(batch: Mistral, config: Config) {
       responseFormat: parsed.format,
       ...(parsed.voice ? { voiceId: parsed.voice } : {}),
       ...(parsed.refAudio ? { refAudio: parsed.refAudio } : {}),
+      ...(parsed.expressiveness !== undefined ? { expressiveness: parsed.expressiveness } : {}),
+      ...(parsed.phonemeHints ? { phonemeHints: parsed.phonemeHints } : {}),
+      ...(parsed.conversationHistory ? { conversationHistory: parsed.conversationHistory } : {}),
     };
 
     try {
@@ -137,7 +229,7 @@ export function createSynthesizeHandler(batch: Mistral, config: Config) {
           }
         },
         // Client went away: stop pulling audio from Mistral.
-        cancel: (reason) => void iterator.return?.(reason),
+        cancel: () => void iterator.return?.(),
       });
       return c.body(body, 200, headers);
     } catch (err) {
