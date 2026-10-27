@@ -17,9 +17,9 @@
     "mock:gladia": "node test/mock-gladia.ts"
   },
   "dependencies": {
-    "@hono/node-server": "^1.14.0",
+    "@hono/node-server": "^1.19.17",
     "@mistralai/mistralai": "3.3.0",
-    "hono": "^4.7.0",
+    "hono": "^4.13.14",
     "ws": "^8.18.0"
   },
   "devDependencies": {
