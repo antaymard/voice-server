@@ -1,16 +1,25 @@
 # voice-server
 
 Minimal speech-to-text backend for React apps, powered by the
-[Mistral (Voxtral)](https://docs.mistral.ai/studio-api/audio/speech_to_text) API,
+[Mistral Voxtral 3](https://docs.mistral.ai/studio/audio/overview) API,
 with optional [Gladia](https://docs.gladia.io)-backed alternatives.
+
+> **Upgrading a client app from Voxtral 2?** Read
+> [`docs/voxtral-3.md`](docs/voxtral-3.md): what changed, what's new, and
+> what (little) you need to touch.
 
 - **Realtime**: browser streams mic audio over a WebSocket, the server bridges
   it to Mistral's realtime transcription and streams text deltas back
-  (sub-second latency, tunable).
+  (80 ms–2.4 s latency, tunable). Voxtral 3 adds **turn detection** (know when
+  the user stopped talking), live **speaker labels**, a language pin and
+  vocabulary biasing.
 - **Bulk**: upload a complete audio file (or pass a URL), get the transcript
-  back as JSON.
-- **Text to speech**: POST text, stream back raw audio (Mistral Voxtral TTS),
-  latency-tuned (`pcm` streaming for the fastest time-to-first-audio).
+  back as JSON — speaker labels, **known-speaker references**, vocabulary
+  biasing, and an optional higher-quality model (Voxtral Small Transcribe 3).
+- **Text to speech**: POST text, stream back raw audio (Voxtral TTS 3),
+  latency-tuned (`pcm` streaming for the fastest time-to-first-audio), with
+  inline **emotion/pace tags**, an expressiveness dial, custom pronunciation
+  and conversation-aware delivery. `GET /v1/voices` lists the 36 preset voices.
 - **Gladia alternatives** (`/v1/gladia/*`, opt-in via `GLADIA_API_KEY`):
   live and bulk STT with business vocabulary biasing, context prompts,
   speaker-count-aware diarization, summaries/chapters/subtitles, and async
@@ -24,8 +33,8 @@ with optional [Gladia](https://docs.gladia.io)-backed alternatives.
 - One shared token for all your apps + an origin allowlist; your
   `MISTRAL_API_KEY`/`GLADIA_API_KEY` never leave the server.
 - Ships a copyable **React kit** (`client/`) — mic capture worklet,
-  `useRealtimeTranscription` hook, `transcribeFile` helper — and a built-in
-  demo page.
+  `useRealtimeTranscription` hook, `transcribeFile`, `synthesizeSpeech` and
+  `listVoices` helpers — and a built-in demo page.
 
 ## Quick start
 
@@ -63,23 +72,34 @@ are logged server-side (the browser only shows an opaque network error).
 |---|---|---|
 | `file` | yes* | the audio file (mp3, wav, m4a, …) |
 | `file_url` | yes* | alternative to `file` (exactly one of the two) |
-| `language` | no | ISO 639-1 hint, e.g. `fr` |
-| `timestamps` | no | `segment`, `word` or `segment,word` — incompatible with `language` (Mistral limitation) |
-| `diarize` | no | `true` to label speakers |
-| `context_bias` | no | repeatable; words/phrases to bias spelling (max 100) |
+| `model` | no | override `BATCH_MODEL`, e.g. `voxtral-small-transcribe-3-0` for higher quality |
+| `language` | no | ISO 639-1, e.g. `fr`; omit to auto-detect |
+| `timestamps` | no | `segment` (word timestamps no longer exist in Voxtral 3 → `400`) |
+| `diarize` | no | `true` to label speakers (implies `timestamps=segment`) |
+| `context_bias` | no | repeatable; names, multi-word terms, or a one-line description of the recording |
+| `speaker_reference.<Name>` | no | audio file of a known speaker (3–15 s, mostly speech, WAV best; up to 8). `<Name>` becomes their `speaker_id`. Implies `diarize` |
 
-Or `application/json`: `{ "file_url", "language?", "timestamp_granularities?": ["segment"], "diarize?", "context_bias?": [] }`.
+Or `application/json`: `{ "file_url", "model?", "language?", "timestamp_granularities?": ["segment"], "diarize?", "context_bias?": [], "speaker_references?": { "Alice": "<base64 audio>" } }`.
 
 ```bash
 curl -X POST https://your-server/v1/transcribe \
   -H "Authorization: Bearer $AUTH_TOKEN" \
-  -F file=@meeting.mp3
-# -> { "model": "...", "text": "…", "language": "fr", "segments": [], "usage": {...} }
+  -F file=@meeting.mp3 \
+  -F diarize=true \
+  -F speaker_reference.Alice=@alice.wav \
+  -F "context_bias=Voxtral" -F "context_bias=Weekly product sync of a French startup"
+# -> { "model": "voxtral-mini-transcribe-3-0", "text": "…", "language": null,
+#      "segments": [ { "type": "transcription_segment", "text": " Bonjour…", "start": 0.4,
+#                      "end": 3.1, "speakerId": "Alice" }, … ], "usage": {...} }
 ```
 
-Responses are passed through from Mistral. Uploads above `MAX_UPLOAD_BYTES`
-get `413`; upstream auth problems surface as `502 upstream_auth` (it's the
-server's key, not yours).
+Responses are passed through from Mistral. Diarized segments **can overlap**
+(two people talking at once); speakers without a reference are labelled
+`speaker_1`, `speaker_2`… (stable within one response only). Vocabulary
+entries share the model's context window with the audio: keep the list short
+on long recordings (too long → `400` from Mistral). Uploads above
+`MAX_UPLOAD_BYTES` get `413`; upstream auth problems surface as `502
+upstream_auth` (it's the server's key, not yours).
 
 ### `POST /v1/speak` — text to speech
 
@@ -88,12 +108,29 @@ Powered by Mistral's [Voxtral TTS](https://docs.mistral.ai/studio-api/audio/text
 
 | Field | Required | Default | Notes |
 |---|---|---|---|
-| `input` | yes | — | text to synthesize (≤ `MAX_TTS_CHARS`) |
+| `input` | yes | — | text to synthesize (≤ `MAX_TTS_CHARS`), may contain emotion/pace tags (below) |
 | `format` | no | `pcm` | `pcm`, `wav`, `mp3`, `flac` or `opus` |
-| `voice` | no | `TTS_VOICE` | preset or saved voice id; omit for the Mistral default |
+| `voice` | no | `TTS_VOICE` | preset or saved voice id (see `GET /v1/voices`); omit for the Mistral default |
 | `ref_audio` | no | — | base64 audio for one-off zero-shot voice cloning |
 | `model` | no | `TTS_MODEL` | override the synthesis model |
 | `stream` | no | `true` | stream audio as it is generated (lowest latency) |
+| `expressiveness` | no | Mistral's | 1.0–5.0: stronger emotional delivery, at the cost of similarity to the voice |
+| `phoneme_hints` | no | — | custom pronunciation: `{ "tomato": ["t","ə","m","ɑ","t","oʊ"] }` — one IPA symbol per item; unknown symbols → `400` listing the supported ones |
+| `conversation_history` | no | — | prior turns, oldest first, alternating and ending with `user`: `[{ "role": "user", "audio": "<b64>" }, { "role": "assistant", "text": "…", "audio": "<b64>" }, …]` — the reply's tone fits the conversation. Needs a Voxtral 3 preset `voice`; not with `ref_audio` |
+
+**Emotion and pace tags** (Voxtral 3) go inline in `input`, before the text
+they apply to, and are not spoken: `"[emotion=happy]We passed the audit!
+[emotion=calm][pace=slow]Now, the details."` — 34 emotions (`amused`,
+`angry`, `anxious`, `apologetic`, `appreciative`, `assertive`, `bored`,
+`calm`, `confident`, `confused`, `critical`, `curious`, `determined`,
+`disappointed`, `disgusted`, `excited`, `frustrated`, `grateful`, `happy`,
+`hopeful`, `playful`, `proud`, `reflective`, `resigned`, `sad`, `sarcastic`,
+`skeptical`, `somber`, `surprised`, `tense`, `tired`, `urgent`, `warm`,
+`wistful`) and 5 paces (`very-slow`, `slow`, `moderate`, `fast`,
+`very-fast`). Documented for English, expected to work in fr/de/es/it/pt/hi;
+unknown values are silently ignored. Voxtral 2 per-emotion presets (e.g.
+`gb_jane_sad`) still work. The request body is capped at `MAX_UPLOAD_BYTES`
+(it may carry base64 audio).
 
 The response body is the **raw audio bytes** (not base64/JSON) with a matching
 `Content-Type`, streamed chunk-by-chunk via chunked transfer when `stream` is
@@ -119,6 +156,24 @@ curl -X POST https://your-server/v1/speak \
 end-to-end from Mistral, vs ~3 s for `mp3`, which is encoded before it streams).
 Pick `pcm` for live playback and `mp3`/`opus` when you want a self-describing
 file you can drop straight into an `<audio>` element.
+
+### `GET /v1/voices` — list TTS voices
+
+Mistral's preset voices plus the voices saved in the server's Mistral
+workspace. Query parameters (all optional): `type` (`all` | `preset` |
+`custom`), `language` (comma list, e.g. `fr,en`), `gender` (`female`,
+`male`, `neutral`), `query` (free text), `page_size` (1–100), `page_token`.
+
+```bash
+curl "https://your-server/v1/voices?type=preset&language=fr" -H "Authorization: Bearer $AUTH_TOKEN"
+# -> { "voices": [ { "id": "voice_592", "name": "Marie", "slug": null, "type": "preset",
+#                    "languages": ["fr"], "gender": "female", "description": null, "tags": [] }, … ],
+#      "nextPageToken": null }
+```
+
+Pass a voice's `id` as `voice` to `/v1/speak`. Voxtral 3 ships 36 presets
+across 22 languages (French: Marie `voice_592`, Manon `voice_3137`, Lea
+`voice_589`, Camille `voice_3141`).
 
 ### `POST /v1/gladia/transcribe` — bulk transcription (Gladia)
 
@@ -300,7 +355,21 @@ Client → server:
 
 1. First frame (text): `{"type":"start","sampleRate":16000,"targetDelayMs":480}`
    — `sampleRate` ∈ {8000, 16000, 22050, 44100, 48000}; `targetDelayMs`
-   clamped to [240, 2400] (lower = faster, higher = more accurate).
+   80–1200 or 2400 (lower = faster, higher = more accurate; out-of-range
+   values are clamped, values between 1200 and 2400 snap to the nearest).
+   Optional Voxtral 3 fields, all applied before any audio (Mistral locks
+   them once audio starts):
+
+   | Field | Type | Meaning |
+   |---|---|---|
+   | `language` | string | ISO 639-1 pin, e.g. `"fr"`; omit to auto-detect |
+   | `contextBias` | string[] | names, terms or a short description, to fix spellings |
+   | `diarize` | bool | speaker labels: `segment` events replace `delta` events |
+   | `speakerReferences` | `{ name: base64 }` | known speakers (3–15 s clips, ≤ 8; keep the frame under 1 MiB — prefer Opus/MP3). Implies `diarize` |
+   | `turnDetection` | `true` \| object | emit `turn` events. Object = tuning: `startThreshold` (0.5), `eagerEndThreshold` (0.5), `endThreshold` (0.33), `minSilenceMs` (500), `endTimeoutMs` (3000). "Aggressive" preset (ends turns sooner): `0.5 / 0.4 / 0.33 / 300 / 2500` |
+
+   `diarize` and `turnDetection` cannot be combined. Invalid options get an
+   `error` (`bad_message`) and close `4400`, before anything is sent upstream.
 2. Binary frames: raw **PCM s16le mono** at the declared rate (~100 ms per
    frame recommended; max 1 MiB per frame).
 3. `{"type":"flush"}` (optional): force early processing of buffered audio.
@@ -311,9 +380,10 @@ Server → client (JSON text frames):
 
 | Event | Payload | Meaning |
 |---|---|---|
-| `ready` | `requestId, model, sampleRate, targetDelayMs` | session is live, send audio |
-| `delta` | `text` | committed transcript text (append-only) |
-| `segment` | `text, start, end` | finalized segment with timestamps (s) |
+| `ready` | `requestId, model, sampleRate, targetDelayMs, language, diarize, turnDetection` | session is live, send audio (echoes the applied settings) |
+| `delta` | `text` | committed transcript text (append-only); not sent when diarizing |
+| `segment` | `text, start, end, speakerId` | diarized text, labelled `speaker_1`… or a reference name; `start`/`end` are `null` in realtime |
+| `turn` | `phase, time, endReason?` | turn detection: `phase` ∈ `start`, `eager_end` (probably done — start only discardable work), `resume` (cancels the eager end), `end` (final; `endReason` = `threshold` \| `timeout`). `time` = seconds into the stream |
 | `language` | `language` | detected language (`fr`, `en`, …) |
 | `done` | `text, language, segments[], usage` | final transcript, then close `1000` |
 | `error` | `code, message` | see codes below, then close |
@@ -325,8 +395,8 @@ Close codes: `1000` done · `1001` server shutdown · `1009` frame too large ·
 `1011` internal · `4400` protocol violation · `4408` idle timeout · `4413` max
 session duration · `4502` upstream failure.
 
-Notes: realtime auto-detects the language (no language parameter upstream) and
-does not support `diarize`. The server pings every 30 s; sessions are capped
+Notes: deltas can still arrive after a `turn.end`; wait for `turn` `end`
+(not `eager_end`) before anything irreversible. The server pings every 30 s; sessions are capped
 by `MAX_SESSION_MS` (a graceful finalize is attempted first) and reaped after
 `IDLE_TIMEOUT_MS` without client frames.
 
@@ -411,17 +481,17 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `AUTH_TOKEN` | yes | — | shared bearer token for your apps (use `openssl rand -hex 32`) |
 | `ALLOWED_ORIGINS` | yes | — | comma-separated origins; `*` disables the check (dev only) |
 | `PORT` | no | `3000` | injected by Railway |
-| `BATCH_MODEL` | no | `voxtral-mini-latest` | bulk transcription model |
-| `REALTIME_MODEL` | no | `voxtral-mini-transcribe-realtime-2602` | realtime model |
-| `TTS_MODEL` | no | `voxtral-mini-tts-2603` | text-to-speech model |
+| `BATCH_MODEL` | no | `voxtral-mini-transcribe-3-0` | bulk transcription model (`voxtral-small-transcribe-3-0` = higher quality) |
+| `REALTIME_MODEL` | no | `voxtral-mini-transcribe-realtime-3-0` | realtime model |
+| `TTS_MODEL` | no | `voxtral-mini-tts-3-0` | text-to-speech model |
 | `TTS_VOICE` | no | — | default voice id (empty = Mistral's default) |
 | `TTS_FORMAT` | no | `pcm` | default output format when the request omits one |
 | `MAX_TTS_CHARS` | no | `8000` | max characters per `/v1/speak` request |
-| `MAX_UPLOAD_BYTES` | no | `26214400` (25 MB) | bulk upload cap |
+| `MAX_UPLOAD_BYTES` | no | `26214400` (25 MB) | bulk upload cap (also caps `/v1/speak` bodies) |
 | `MAX_SESSIONS` | no | `20` | concurrent realtime sessions |
 | `MAX_SESSION_MS` | no | `600000` (10 min) | per-session duration cap |
 | `IDLE_TIMEOUT_MS` | no | `60000` | close sessions with no client frames |
-| `DEFAULT_TARGET_DELAY_MS` | no | `480` | default latency/accuracy tradeoff |
+| `DEFAULT_TARGET_DELAY_MS` | no | `480` | default latency/accuracy tradeoff (80–1200 or 2400) |
 | `MISTRAL_BASE_URL` | no | `https://api.mistral.ai` | upstream override (tests/mock) |
 | `MISTRAL_WS_URL` | no | `wss://api.mistral.ai` | upstream override (tests/mock) |
 | `GLADIA_API_KEY` | no | — | enables `/v1/gladia/*`; empty = those endpoints answer 503 |
@@ -494,17 +564,21 @@ on :9098 with `GLADIA_API_KEY=any GLADIA_BASE_URL=http://127.0.0.1:9098`).
 
 ## Known limitations
 
-- Realtime (Mistral): language is auto-detected (no hint parameter upstream);
-  `diarize` is batch-only. The Gladia realtime endpoint accepts language
-  hints and vocabulary if you need them live.
+- Voxtral 3 is in **public preview** at Mistral. To roll back, set
+  `BATCH_MODEL=voxtral-mini-2602`, `REALTIME_MODEL=voxtral-mini-transcribe-realtime-2602`,
+  `TTS_MODEL=voxtral-mini-tts-2603` (the Voxtral 3–only options then fail upstream).
+- Realtime (Mistral): `diarize` and `turnDetection` are mutually exclusive
+  (Mistral limitation); realtime segments carry no timestamps.
+- Not exposed yet: Voxtral TTS Realtime 3 (`voxtral-mini-tts-realtime-3-0`,
+  a live-conversation speech stream), TTS style instructions (not available
+  at Mistral's launch), and Mistral's managed Voice Agents.
 - Gladia bulk: `sentiment_analysis`, `moderation`, translation and
   `audio_to_llm` add-ons are not exposed yet (easy to add in
   `src/gladia/transcribe.ts` if needed); the demo page only exercises the
   Mistral endpoints.
-- Bulk: `timestamps` cannot be combined with `language` (current Mistral
-  limitation).
-- `@mistralai/mistralai` is pinned to exactly `2.2.5`: the published SDK does
-  not expose `target_streaming_delay_ms` yet, so the server sends that
-  `session.update` frame itself (`src/mistral.ts`). Revisit on SDK updates.
+- `@mistralai/mistralai` is pinned to exactly `3.3.0`: its realtime client
+  only sets the audio format and doesn't model turn events, so the server
+  sends the full `session.update` frame itself and reads `turn.*` events raw
+  (`src/mistral.ts`, `src/realtime/bridge.ts`). Revisit on SDK updates.
 - The batch SSE streaming variant is not exposed (bulk responses return in one
   shot).

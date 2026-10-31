@@ -115,6 +115,91 @@ test("happy path: start -> ready -> audio deltas -> stop -> done -> close 1000",
   assert.equal(close.code, 1000);
 });
 
+test("Voxtral 3 session options go upstream in the first session.update", async () => {
+  const client = connect(server.port);
+  await client.opened;
+  client.ws.send(
+    JSON.stringify({
+      type: "start",
+      sampleRate: 16000,
+      targetDelayMs: 1500, // snaps to 1200
+      language: "fr",
+      contextBias: ["Voxtral", "Mistral AI"],
+      turnDetection: { minSilenceMs: 300, endTimeoutMs: 2500 },
+    }),
+  );
+  const ready = await client.next((ev) => ev.type === "ready");
+  assert.deepEqual(
+    { ...ready, requestId: undefined },
+    {
+      type: "ready",
+      requestId: undefined,
+      model: "voxtral-mini-transcribe-realtime-3-0",
+      sampleRate: 16000,
+      targetDelayMs: 1200,
+      language: "fr",
+      diarize: false,
+      turnDetection: true,
+    },
+  );
+  assert.deepEqual(mock.received.realtimeSession, {
+    audio_format: { encoding: "pcm_s16le", sample_rate: 16000 },
+    target_streaming_delay_ms: 1200,
+    language: "fr",
+    context_bias: ["Voxtral", "Mistral AI"],
+    turn_detection: {
+      start_threshold: 0.5,
+      eager_end_threshold: 0.5,
+      end_threshold: 0.33,
+      min_silence_ms: 300,
+      end_timeout_ms: 2500,
+    },
+  });
+
+  client.ws.send(pcmFrame());
+  const turnStart = await client.next((ev) => ev.type === "turn");
+  assert.deepEqual(turnStart, { type: "turn", phase: "start", time: 0.1 });
+  await client.next((ev) => ev.type === "delta");
+  client.ws.send(JSON.stringify({ type: "stop" }));
+  const turnEnd = await client.next((ev) => ev.type === "turn" && ev.phase === "end");
+  assert.deepEqual(turnEnd, { type: "turn", phase: "end", time: 1, endReason: "threshold" });
+  await client.next((ev) => ev.type === "done");
+  assert.equal((await client.closed).code, 1000);
+});
+
+test("diarized session streams speaker-labelled segments", async () => {
+  const client = connect(server.port);
+  await client.opened;
+  client.ws.send(JSON.stringify({ type: "start", speakerReferences: { Alice: "QUFB" } }));
+  const ready = await client.next((ev) => ev.type === "ready");
+  assert.equal((ready as { diarize: boolean }).diarize, true);
+  assert.equal(mock.received.realtimeSession?.["diarize"], true);
+  assert.deepEqual(mock.received.realtimeSession?.["speaker_references"], { Alice: "QUFB" });
+
+  client.ws.send(pcmFrame());
+  const segment = await client.next((ev) => ev.type === "segment");
+  assert.deepEqual(segment, {
+    type: "segment",
+    text: "p1 ",
+    start: null,
+    end: null,
+    speakerId: "speaker_1",
+  });
+  client.ws.send(JSON.stringify({ type: "stop" }));
+  const done = await client.next((ev) => ev.type === "done");
+  assert.equal((done as { segments: { speakerId: string }[] }).segments[0]?.speakerId, "speaker_1");
+});
+
+test("invalid session options are rejected locally with close 4400 (no reconnect loop)", async () => {
+  const client = connect(server.port);
+  await client.opened;
+  client.ws.send(JSON.stringify({ type: "start", diarize: true, turnDetection: true }));
+  const error = await client.next((ev) => ev.type === "error");
+  assert.equal((error as { code: string }).code, "bad_message");
+  assert.match((error as { message: string }).message, /not compatible/);
+  assert.equal((await client.closed).code, 4400);
+});
+
 test("missing or wrong token is rejected at upgrade with 401", async () => {
   for (const token of [null, "wrong-token"]) {
     const client = connect(server.port, { token });

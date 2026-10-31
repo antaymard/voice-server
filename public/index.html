@@ -64,18 +64,31 @@
         <div>
           <label for="delay">Target delay</label>
           <select id="delay">
-            <option value="240">240 ms — fastest</option>
+            <option value="80">80 ms — fastest</option>
+            <option value="240">240 ms — fast</option>
             <option value="480" selected>480 ms — balanced</option>
-            <option value="1000">1000 ms — accurate</option>
+            <option value="1200">1200 ms — accurate</option>
             <option value="2400">2400 ms — most accurate</option>
           </select>
+        </div>
+        <div>
+          <label for="mode">Mode (Voxtral 3)</label>
+          <select id="mode">
+            <option value="plain" selected>Plain transcript</option>
+            <option value="turns">Turn detection</option>
+            <option value="diarize">Speaker labels</option>
+          </select>
+        </div>
+        <div>
+          <label for="rlang">Language (optional)</label>
+          <input type="text" id="rlang" placeholder="auto-detect, or e.g. fr" maxlength="2" />
         </div>
       </div>
       <button id="micStart" class="primary">Start mic</button>
       <button id="micStop" disabled>Stop</button>
       <span class="status"><span class="dot" id="micDot"></span><span id="micStatus">idle</span></span>
       <div class="transcript" id="transcript"></div>
-      <div class="meta">language: <span id="lang">–</span></div>
+      <div class="meta">language: <span id="lang">–</span> · turn: <span id="turn">–</span></div>
     </section>
 
     <section>

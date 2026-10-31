@@ -39,9 +39,20 @@ async function startMic() {
   const token = requireToken();
   if (!token) return;
   const targetDelayMs = Number($("delay").value) || 480;
+  const mode = $("mode").value;
+  const language = $("rlang").value.trim();
+  const start = {
+    type: "start",
+    sampleRate: 16000,
+    targetDelayMs,
+    ...(language ? { language } : {}),
+    ...(mode === "turns" ? { turnDetection: true } : {}),
+    ...(mode === "diarize" ? { diarize: true } : {}),
+  };
 
   $("transcript").textContent = "";
   $("lang").textContent = "–";
+  $("turn").textContent = "–";
   $("micStart").disabled = true;
   setMicStatus("requesting mic…");
 
@@ -79,7 +90,7 @@ async function startMic() {
   mic.ready = false;
   mic.pending = [];
 
-  ws.onopen = () => ws.send(JSON.stringify({ type: "start", sampleRate: 16000, targetDelayMs }));
+  ws.onopen = () => ws.send(JSON.stringify(start));
   ws.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     switch (ev.type) {
@@ -93,11 +104,18 @@ async function startMic() {
       case "delta":
         $("transcript").textContent += ev.text;
         break;
+      case "segment":
+        $("transcript").textContent += `\n[${ev.speakerId ?? "?"}]${ev.text}`;
+        break;
+      case "turn":
+        $("turn").textContent =
+          `${ev.phase} @ ${ev.time.toFixed(2)}s${ev.endReason ? ` (${ev.endReason})` : ""}`;
+        break;
       case "language":
         $("lang").textContent = ev.language;
         break;
       case "done":
-        $("transcript").textContent = ev.text;
+        if (mode !== "diarize") $("transcript").textContent = ev.text;
         setMicStatus("done");
         break;
       case "error":

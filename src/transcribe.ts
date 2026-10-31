@@ -2,16 +2,24 @@ import type { Context } from "hono";
 import type { Mistral } from "@mistralai/mistralai";
 import type { Config } from "./config.ts";
 
-const TIMESTAMP_VALUES = ["segment", "word"] as const;
-type TimestampGranularity = (typeof TIMESTAMP_VALUES)[number];
+/** Voxtral 3 dropped word-level timestamps; only segments remain. */
+type TimestampGranularity = "segment";
+
+/** Max known-speaker clips per request (Mistral limit). */
+const MAX_SPEAKER_REFERENCES = 8;
+/** Multipart file fields named `speaker_reference.<name>` carry reference clips. */
+const SPEAKER_REFERENCE_FIELD = "speaker_reference.";
 
 type ParsedRequest = {
   file?: { fileName: string; content: Blob };
   fileUrl?: string;
+  model?: string;
   language?: string;
   timestampGranularities?: TimestampGranularity[];
   diarize?: boolean;
   contextBias?: string[];
+  /** name -> base64 audio */
+  speakerReferences?: Record<string, string>;
 };
 
 class RequestError extends Error {}
@@ -24,11 +32,32 @@ function parseTimestamps(value: unknown): TimestampGranularity[] {
         ? value
         : [];
   return items.map((item) => {
-    if (!(TIMESTAMP_VALUES as readonly unknown[]).includes(item)) {
-      throw new RequestError(`Invalid timestamps value "${String(item)}" (use "segment" or "word")`);
+    if (item === "word") {
+      throw new RequestError(
+        "Word timestamps are not available with Voxtral 3 (use \"segment\")",
+      );
     }
-    return item as TimestampGranularity;
+    if (item !== "segment") {
+      throw new RequestError(`Invalid timestamps value "${String(item)}" (use "segment")`);
+    }
+    return item;
   });
+}
+
+function checkSpeakerReferences(refs: Record<string, string>): Record<string, string> | undefined {
+  const entries = Object.entries(refs);
+  if (entries.length === 0) return undefined;
+  if (entries.length > MAX_SPEAKER_REFERENCES) {
+    throw new RequestError(`At most ${MAX_SPEAKER_REFERENCES} speaker references are supported`);
+  }
+  if (entries.some(([name, audio]) => !name.trim() || !audio)) {
+    throw new RequestError("Speaker references need a non-empty name and audio");
+  }
+  return refs;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
 }
 
 function parseContextBias(values: unknown[]): string[] {
@@ -44,16 +73,25 @@ async function parseMultipart(c: Context): Promise<ParsedRequest> {
   if (file !== null && !(file instanceof Blob)) {
     throw new RequestError("`file` must be an uploaded file");
   }
-  const fileUrl = form.get("file_url");
-  const language = form.get("language");
   const diarize = form.get("diarize");
+  const speakerReferences: Record<string, string> = {};
+  for (const [key, value] of form.entries()) {
+    if (!key.startsWith(SPEAKER_REFERENCE_FIELD)) continue;
+    if (!(value instanceof Blob)) {
+      throw new RequestError(`\`${key}\` must be an uploaded audio file`);
+    }
+    const name = key.slice(SPEAKER_REFERENCE_FIELD.length);
+    speakerReferences[name] = Buffer.from(await value.arrayBuffer()).toString("base64");
+  }
   return {
     file: file ? { fileName: (file instanceof File && file.name) || "audio", content: file } : undefined,
-    fileUrl: typeof fileUrl === "string" && fileUrl ? fileUrl : undefined,
-    language: typeof language === "string" && language ? language : undefined,
+    fileUrl: optionalString(form.get("file_url")),
+    model: optionalString(form.get("model")),
+    language: optionalString(form.get("language")),
     timestampGranularities: parseTimestamps(form.get("timestamps") ?? undefined),
     diarize: diarize === "true" || diarize === "1",
     contextBias: parseContextBias(form.getAll("context_bias")),
+    speakerReferences: checkSpeakerReferences(speakerReferences),
   };
 }
 
@@ -62,16 +100,26 @@ function parseJson(body: unknown): ParsedRequest {
     throw new RequestError("JSON body must be an object");
   }
   const obj = body as Record<string, unknown>;
-  const fileUrl = obj["file_url"];
-  const language = obj["language"];
+  const refs = obj["speaker_references"];
+  if (
+    refs !== undefined &&
+    (typeof refs !== "object" ||
+      refs === null ||
+      Array.isArray(refs) ||
+      !Object.values(refs).every((v) => typeof v === "string"))
+  ) {
+    throw new RequestError("`speaker_references` must map speaker names to base64 audio strings");
+  }
   return {
-    fileUrl: typeof fileUrl === "string" && fileUrl ? fileUrl : undefined,
-    language: typeof language === "string" && language ? language : undefined,
+    fileUrl: optionalString(obj["file_url"]),
+    model: optionalString(obj["model"]),
+    language: optionalString(obj["language"]),
     timestampGranularities: parseTimestamps(obj["timestamp_granularities"]),
     diarize: obj["diarize"] === true,
     contextBias: parseContextBias(
       Array.isArray(obj["context_bias"]) ? obj["context_bias"] : [obj["context_bias"]],
     ),
+    speakerReferences: checkSpeakerReferences((refs as Record<string, string> | undefined) ?? {}),
   };
 }
 
@@ -141,21 +189,22 @@ export function createTranscribeHandler(batch: Mistral, config: Config) {
     if (parsed.file && parsed.fileUrl) {
       return badRequest("Provide either `file` or `file_url`, not both");
     }
-    if (parsed.language && (parsed.timestampGranularities?.length ?? 0) > 0) {
-      // Upstream limitation as of Voxtral Transcribe 2 — may be lifted later.
-      return badRequest("`language` cannot be combined with timestamps (Mistral API limitation)");
-    }
+    // Reference clips only make sense with diarization, and Voxtral 3 only
+    // diarizes with segment timestamps (422 otherwise): imply both so callers
+    // can just ask for `diarize`.
+    const diarize = parsed.diarize === true || parsed.speakerReferences !== undefined;
+    const timestamps: TimestampGranularity[] =
+      diarize ? ["segment"] : (parsed.timestampGranularities ?? []);
 
     try {
       const result = await batch.audio.transcriptions.complete({
-        model: config.batchModel,
+        model: parsed.model ?? config.batchModel,
         ...(parsed.file ? { file: parsed.file } : { fileUrl: parsed.fileUrl }),
         ...(parsed.language ? { language: parsed.language } : {}),
-        ...(parsed.timestampGranularities?.length
-          ? { timestampGranularities: parsed.timestampGranularities }
-          : {}),
-        ...(parsed.diarize ? { diarize: true } : {}),
+        ...(timestamps.length ? { timestampGranularities: timestamps } : {}),
+        ...(diarize ? { diarize: true } : {}),
         ...(parsed.contextBias?.length ? { contextBias: parsed.contextBias } : {}),
+        ...(parsed.speakerReferences ? { speakerReferences: parsed.speakerReferences } : {}),
       });
       return c.json(result);
     } catch (err) {

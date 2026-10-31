@@ -5,7 +5,10 @@ import {
   type DoneEvent,
   type SegmentEvent,
   type ServerErrorEvent,
+  type StartMessage,
   type TranscriptSegment,
+  type TurnDetectionOptions,
+  type TurnEvent,
 } from "./protocol.ts";
 import { createPcmWorkletUrl } from "./worklet.ts";
 
@@ -22,8 +25,24 @@ export type UseRealtimeTranscriptionOptions = {
   serverUrl: string;
   /** The server's shared AUTH_TOKEN. */
   token: string;
-  /** Latency/accuracy tradeoff in ms (240-2400, server default 480). */
+  /** Latency/accuracy tradeoff in ms (80-1200 or 2400, server default 480). */
   targetDelayMs?: number;
+  /** Pin the spoken language (ISO 639-1, e.g. "fr"); omit to auto-detect. */
+  language?: string;
+  /** Names/terms (or a one-line description) to get spellings right. */
+  contextBias?: string[];
+  /**
+   * Label speakers. Text then arrives as `segments` (with `speakerId`) and
+   * is mirrored into `text`. Incompatible with `turnDetection`.
+   */
+  diarize?: boolean;
+  /** Known speakers: name -> base64 clip (3-15 s, up to 8). Implies `diarize`. */
+  speakerReferences?: Record<string, string>;
+  /**
+   * Turn detection: `true` for Mistral defaults, or tuning options (see
+   * `TURN_DETECTION_PRESETS`). Events arrive via `onTurn`.
+   */
+  turnDetection?: boolean | TurnDetectionOptions;
   /** Audio chunk duration sent over the socket (default 100 ms). */
   chunkMs?: number;
   /** Reconnect automatically on unexpected disconnects (default true, 3 attempts). */
@@ -31,6 +50,8 @@ export type UseRealtimeTranscriptionOptions = {
   /** Override the worklet module URL (for CSPs that forbid blob: workers). */
   workletUrl?: string;
   onSegment?: (segment: SegmentEvent) => void;
+  /** Turn detection events (needs `turnDetection`). Wait for `end` before irreversible actions. */
+  onTurn?: (turn: TurnEvent) => void;
   onDone?: (event: DoneEvent) => void;
   onError?: (error: ServerErrorEvent) => void;
 };
@@ -152,8 +173,16 @@ export function useRealtimeTranscription(
         break;
       }
       case "segment": {
-        setSegments((prev) => [...prev, { text: event.text, start: event.start, end: event.end }]);
+        const { text: segmentText, start, end, speakerId } = event;
+        setSegments((prev) => [...prev, { text: segmentText, start, end, speakerId }]);
+        // Diarized sessions send segments instead of deltas: keep `text` live.
+        textRef.current += segmentText;
+        setText(textRef.current);
         optionsRef.current.onSegment?.(event);
+        break;
+      }
+      case "turn": {
+        optionsRef.current.onTurn?.(event);
         break;
       }
       case "language": {
@@ -234,13 +263,17 @@ export function useRealtimeTranscription(
     session.ready = false;
     ws.onopen = () => {
       if (isStale(session) || session.ws !== ws) return;
-      ws.send(
-        JSON.stringify({
-          type: "start",
-          sampleRate: SAMPLE_RATE,
-          ...(opts.targetDelayMs !== undefined ? { targetDelayMs: opts.targetDelayMs } : {}),
-        }),
-      );
+      const startMessage: StartMessage = {
+        type: "start",
+        sampleRate: SAMPLE_RATE,
+        targetDelayMs: opts.targetDelayMs,
+        language: opts.language,
+        contextBias: opts.contextBias,
+        diarize: opts.diarize,
+        speakerReferences: opts.speakerReferences,
+        turnDetection: opts.turnDetection,
+      };
+      ws.send(JSON.stringify(startMessage)); // undefined fields are dropped
     };
     ws.onmessage = (e) => {
       if (typeof e.data === "string") handleEvent(session, e.data);

@@ -17,7 +17,7 @@ function Dictation() {
   const { status, text, language, error, start, stop } = useRealtimeTranscription({
     serverUrl: import.meta.env.VITE_VOICE_SERVER_URL, // e.g. "https://voice.example.com"
     token: import.meta.env.VITE_VOICE_SERVER_TOKEN,
-    targetDelayMs: 480, // 240 = fastest, 2400 = most accurate
+    targetDelayMs: 480, // 80 = fastest … 1200, or 2400 = most accurate
   });
 
   return (
@@ -53,9 +53,43 @@ What the hook does for you:
 - `start()` must be called from a user gesture (iOS requires it to unlock the
   `AudioContext`). Setup failures surface in `error`/`status`, not as throws.
 
-`segments` collects finalized segments with timestamps; `onSegment`, `onDone`
-and `onError` callbacks fire alongside the state updates. Timestamps restart
-from zero after a reconnect.
+`onDone` and `onError` callbacks fire alongside the state updates.
+
+### Voxtral 3 session options
+
+All optional, sent once when the session starts (Mistral locks them when
+audio begins — changing them means `stop()` then `start()` again):
+
+```tsx
+import { TURN_DETECTION_PRESETS, useRealtimeTranscription } from "./voice/index.ts";
+
+const voice = useRealtimeTranscription({
+  serverUrl, token,
+  language: "fr",                       // pin the language (default: auto-detect)
+  contextBias: ["Nolênor", "Voxtral"],  // spellings to get right
+  turnDetection: true,                  // or TURN_DETECTION_PRESETS.aggressive, or { minSilenceMs: 300, … }
+  onTurn: (turn) => {
+    if (turn.phase === "eager_end") prefetchAnswer();   // discardable work only
+    if (turn.phase === "resume") cancelPrefetch();      // the user kept talking
+    if (turn.phase === "end") submit(voice.text);       // final: safe to act
+  },
+});
+```
+
+**Turn detection** tells a voice UI when the user has finished speaking:
+`start` → (`eager_end` → `resume`)* → `end` (`endReason`: `threshold` or
+`timeout`). Eager ends are frequent; only `end` is final. A few deltas can
+still arrive after `end`.
+
+**Speaker labels**: `diarize: true` (or `speakerReferences: { Alice: base64Clip }`
+to name known voices, 3–15 s each, up to 8) switches the server to
+speaker-labelled `segment` events. The hook appends them to `segments`
+(`{ text, speakerId, start: null, end: null }` — realtime segments have no
+timestamps) and mirrors their text into `text`; `onSegment` fires for each.
+Diarization and turn detection can't run in the same session.
+
+Invalid options (e.g. both `diarize` and `turnDetection`) end the session
+with a `bad_message` error and no auto-reconnect.
 
 If your CSP forbids `blob:` workers, serve `public/pcm-worklet.js` yourself
 and pass its URL via `workletUrl`.
@@ -70,12 +104,16 @@ async function onFilePicked(file: File) {
     const result = await transcribeFile(file, {
       serverUrl: import.meta.env.VITE_VOICE_SERVER_URL,
       token: import.meta.env.VITE_VOICE_SERVER_TOKEN,
-      // language: "fr",                  // optional hint
-      // timestamps: ["segment"],         // incompatible with `language`
-      // diarize: true,                   // who is speaking
-      // contextBias: ["Voxtral", "PCM"], // guide tricky spellings
+      // language: "fr",                           // pin (default: auto-detect)
+      // timestamps: ["segment"],                  // word timestamps are gone in Voxtral 3
+      // diarize: true,                            // who is speaking (adds segment timestamps)
+      // speakerReferences: { Alice: aliceClip },  // name known speakers (Blob, 3-15 s)
+      // contextBias: ["Voxtral", "PCM"],          // guide tricky spellings
+      // model: "voxtral-small-transcribe-3-0",    // higher quality
     });
     console.log(result.text, result.language);
+    // With diarize: result.segments = [{ text, start, end, speakerId }, …]
+    // (segments can overlap when people talk over each other).
   } catch (err) {
     if (err instanceof TranscribeError) console.error(err.status, err.code, err.message);
     throw err;
@@ -95,7 +133,9 @@ async function say(text: string) {
       serverUrl: import.meta.env.VITE_VOICE_SERVER_URL,
       token: import.meta.env.VITE_VOICE_SERVER_TOKEN,
       format: "mp3",
-      // voice: "neutral_female",  // preset/saved voice, optional
+      // voice: "voice_592",        // preset/saved voice id (see listVoices)
+      // expressiveness: 2,         // 1-5, stronger delivery
+      // phonemeHints: { tomato: ["t", "ə", "m", "ɑ", "t", "oʊ"] }, // custom pronunciation (IPA)
     });
     const url = URL.createObjectURL(await res.blob());
     await new Audio(url).play();
@@ -104,6 +144,25 @@ async function say(text: string) {
     throw err;
   }
 }
+```
+
+**Emotion and pace** (Voxtral 3): put tags in the text itself —
+`synthesizeSpeech("[emotion=excited]C'est livré ! [emotion=calm][pace=slow]Voici le détail.", …)`.
+34 emotions (`happy`, `warm`, `calm`, `apologetic`, `urgent`, `sad`, …) and
+paces `very-slow`, `slow`, `moderate`, `fast`, `very-fast`; the full list is
+in the main README. Tags are not spoken.
+
+**Voice agents**: pass `conversationHistory` (prior user/assistant turns as
+base64 audio, ending with the user's turn) with a Voxtral 3 preset `voice`, and
+the reply's tone follows the conversation.
+
+**Picking a voice**:
+
+```ts
+import { listVoices } from "./voice/index.ts";
+
+const { voices } = await listVoices({ serverUrl, token, type: "preset", language: ["fr"] });
+// -> [{ id: "voice_592", name: "Marie", languages: ["fr"], gender: "female", … }, …]
 ```
 
 `synthesizeSpeech` returns the raw `fetch` Response, so the body streams

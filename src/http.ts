@@ -7,6 +7,7 @@ import { bearerToken, isOriginAllowed, safeEqual } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { createTranscribeHandler } from "./transcribe.ts";
 import { createSynthesizeHandler } from "./synthesize.ts";
+import { createVoicesHandler } from "./voices.ts";
 import type { GladiaClient } from "./gladia/client.ts";
 import { createGladiaResultHandler, createGladiaTranscribeHandler } from "./gladia/transcribe.ts";
 import type { MediaJobs } from "./media/jobs.ts";
@@ -91,7 +92,10 @@ export function createApp(config: Config, deps: AppDeps): Hono {
   app.post("/v1/gladia/transcribe", uploadLimit, createGladiaTranscribeHandler(deps.gladia, config));
   app.get("/v1/gladia/transcribe/:id", createGladiaResultHandler(deps.gladia));
 
-  app.post("/v1/speak", createSynthesizeHandler(deps.batch, config));
+  // Capped like uploads: Voxtral 3 requests can carry base64 audio
+  // (`ref_audio`, `conversation_history`).
+  app.post("/v1/speak", uploadLimit, createSynthesizeHandler(deps.batch, config));
+  app.get("/v1/voices", createVoicesHandler(deps.batch));
 
   // Long-file preparation for transcription (ffmpeg; no STT here).
   registerMediaRoutes(app, config, deps.media ?? null);

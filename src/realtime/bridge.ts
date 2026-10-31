@@ -11,21 +11,51 @@ import {
   CLOSE_INTERNAL,
   CLOSE_SESSION_TOO_LONG,
   CLOSE_UPSTREAM_ERROR,
-  SAMPLE_RATES,
   normalizeStart,
   parseClientMessage,
   type ServerErrorCode,
   type ServerEvent,
   type StartParams,
+  type TurnPhase,
 } from "../../client/src/protocol.ts";
 import type { Config } from "../config.ts";
-import { sendRawSessionUpdate } from "../mistral.ts";
+import { sendRawSessionUpdate, type RawSessionUpdate } from "../mistral.ts";
 
 const CONNECT_TIMEOUT_MS = 10_000;
 const DONE_GRACE_MS = 10_000;
 const MAX_PENDING_SENDS = 200; // ~20s of audio at 100ms frames
 const MAX_PREREADY_BUFFER_BYTES = 512 * 1024; // ~16s @ 16kHz s16le
 const MAX_CLIENT_BUFFERED_BYTES = 5 * 1024 * 1024;
+
+const TURN_PHASES: Record<string, TurnPhase> = {
+  "turn.start": "start",
+  "turn.eager_end": "eager_end",
+  "turn.resume": "resume",
+  "turn.end": "end",
+};
+
+function toSessionUpdate(params: StartParams): RawSessionUpdate {
+  const turn = params.turnDetection;
+  return {
+    audio_format: { encoding: "pcm_s16le", sample_rate: params.sampleRate },
+    target_streaming_delay_ms: params.targetDelayMs,
+    ...(params.language ? { language: params.language } : {}),
+    ...(params.contextBias ? { context_bias: params.contextBias } : {}),
+    ...(params.diarize ? { diarize: true } : {}),
+    ...(params.speakerReferences ? { speaker_references: params.speakerReferences } : {}),
+    ...(turn
+      ? {
+          turn_detection: {
+            start_threshold: turn.startThreshold,
+            eager_end_threshold: turn.eagerEndThreshold,
+            end_threshold: turn.endThreshold,
+            min_silence_ms: turn.minSilenceMs,
+            end_timeout_ms: turn.endTimeoutMs,
+          },
+        }
+      : {}),
+  };
+}
 
 function rawDataToBuffer(data: RawData): Buffer {
   if (Buffer.isBuffer(data)) return data;
@@ -171,7 +201,21 @@ export function runSession(
       try {
         for await (const event of conn.events()) {
           if (finished) break;
-          if ("raw" in event) continue; // unparseable/unknown upstream event
+          if ("raw" in event) {
+            // The SDK doesn't model Voxtral 3 turn events yet; read them raw.
+            const phase = TURN_PHASES[event.type];
+            const raw = event.raw as { time_s?: unknown; end_reason?: unknown } | null;
+            if (phase && raw && typeof raw.time_s === "number") {
+              const endReason = raw.end_reason;
+              send({
+                type: "turn",
+                phase,
+                time: raw.time_s,
+                ...(endReason === "threshold" || endReason === "timeout" ? { endReason } : {}),
+              });
+            }
+            continue; // other unparseable/unknown upstream events are dropped
+          }
           switch (event.type) {
             case "session.created":
             case "session.updated":
@@ -180,7 +224,13 @@ export function runSession(
               send({ type: "delta", text: event.text });
               break;
             case "transcription.segment":
-              send({ type: "segment", text: event.text, start: event.start, end: event.end });
+              send({
+                type: "segment",
+                text: event.text,
+                start: event.start,
+                end: event.end,
+                speakerId: event.speakerId ?? null,
+              });
               break;
             case "transcription.language":
               send({ type: "language", language: event.audioLanguage });
@@ -194,6 +244,7 @@ export function runSession(
                   text: s.text,
                   start: s.start,
                   end: s.end,
+                  speakerId: s.speakerId ?? null,
                 })),
                 usage: event.usage,
               });
@@ -241,11 +292,9 @@ export function runSession(
       upstream = conn;
       try {
         // WS messages are processed in order upstream, so audio sent after
-        // this update is transcribed with the requested format and delay.
-        sendRawSessionUpdate(conn, {
-          audio_format: { encoding: "pcm_s16le", sample_rate: params.sampleRate },
-          target_streaming_delay_ms: params.targetDelayMs,
-        });
+        // this update is transcribed with the requested settings (which lock
+        // on the first audio chunk).
+        sendRawSessionUpdate(conn, toSessionUpdate(params));
       } catch (err) {
         fail("server_error", String(err), CLOSE_INTERNAL);
         return;
@@ -258,6 +307,9 @@ export function runSession(
         model: config.realtimeModel,
         sampleRate: params.sampleRate,
         targetDelayMs: params.targetDelayMs,
+        language: params.language ?? null,
+        diarize: params.diarize,
+        turnDetection: params.turnDetection !== undefined,
       });
       for (const chunk of preReadyAudio) forwardAudio(chunk);
       preReadyAudio.length = 0;
@@ -302,12 +354,8 @@ export function runSession(
           return;
         }
         const params = normalizeStart(message, config.defaultTargetDelayMs);
-        if (!params) {
-          fail(
-            "bad_message",
-            `Unsupported sampleRate (use one of ${SAMPLE_RATES.join(", ")})`,
-            CLOSE_BAD_MESSAGE,
-          );
+        if ("error" in params) {
+          fail("bad_message", params.error, CLOSE_BAD_MESSAGE);
           return;
         }
         started = true;

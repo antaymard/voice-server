@@ -13,9 +13,18 @@ export {
 export {
   synthesizeSpeech,
   SpeechError,
+  type ConversationTurn,
   type SynthesizeOptions,
   type SpeechFormat,
 } from "./synthesizeSpeech.ts";
+export {
+  listVoices,
+  VoicesError,
+  type ListVoicesOptions,
+  type Voice,
+  type VoicePage,
+} from "./listVoices.ts";
+export { TURN_DETECTION_PRESETS } from "./protocol.ts";
 export { createPcmWorkletUrl, PCM_PROCESSOR_SOURCE } from "./worklet.ts";
 export {
   GLADIA_SAMPLE_RATES,
@@ -44,5 +53,9 @@ export type {
   ServerErrorCode,
   ServerErrorEvent,
   ServerEvent,
+  StartMessage,
   TranscriptSegment,
+  TurnDetectionOptions,
+  TurnEvent,
+  TurnPhase,
 } from "./protocol.ts";
