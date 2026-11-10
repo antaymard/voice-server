@@ -567,6 +567,9 @@ What the server does for you:
   realtime speech WebSocket word by word, so audio can start before the first
   sentence is finished. If that connection fails, the server falls back to
   one speech request per sentence.
+- **Hears from your app.** An `event` message brings in what happens outside
+  the conversation (a long-running agent finishing, a question to relay);
+  the assistant speaks up about it when the moment is right.
 - **Doesn't block on slow tools.** A call that outlives `toolTimeoutMs` (or an
   interruption) keeps running in your app; the model says it's in progress,
   and reports the result when your `tool_result` arrives.
@@ -592,7 +595,17 @@ What the server does for you:
 2. Binary frames of mic audio (PCM s16le mono, as `/v1/realtime`).
 3. Optional text frames: `{ "type": "tool_result", "callId", "output", "isError?" }`,
    `{ "type": "text", "text" }` (a typed user message),
+   `{ "type": "event", "text", "speak?" }` (something happened in your app, see below),
    `{ "type": "interrupt" }` (a "stop talking" button), `{ "type": "stop" }`.
+
+**App events.** `event` tells the assistant something the user did not say:
+a background job progressed or finished, another agent has a question, the
+user selected something. The text joins the conversation marked as coming
+from the app. `speak` sets what the assistant may do with it: `"when_idle"`
+(default) — tell the user as soon as nobody is talking, or stay silent if
+it judges the news not worth saying; `"now"` — same, but it cuts its own
+speech short to do so (never the user's); `"never"` — background
+information only, used in later replies, with no LLM call now.
 
 **Server → client** — JSON text frames, plus **binary frames of the
 assistant's speech** (PCM s16le mono 24 kHz, see `ready.audio`):
