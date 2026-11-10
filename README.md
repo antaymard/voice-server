@@ -629,9 +629,12 @@ assistant's speech** (PCM s16le mono 24 kHz, see `ready.audio`):
 protocol with streaming and tool calls works. The default is Mistral
 (`mistral-small-latest`, with your `MISTRAL_API_KEY`).
 
-The shortest way to another model is OpenRouter: set `OPENROUTER_API_KEY`
-and the default becomes `anthropic/claude-haiku-5.5` through OpenRouter;
-pick anything else there with `LLM_MODEL=openrouter:<vendor>/<model>`.
+A voice conversation needs a fast first word more than depth, hence a small
+direct model by default (measured here: about 0.1 s to the first word with
+`mistral-small-latest`, about 0.75 s with Claude Haiku 5.5 through
+OpenRouter). To try another model, `OPENROUTER_API_KEY` adds an `openrouter`
+provider: `LLM_MODEL=openrouter:<vendor>/<model>` makes one the default, or
+list some in `LLM_MODELS` and let apps pick per conversation.
 
 To swap or add other endpoints:
 
@@ -753,7 +756,7 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `MISTRAL_WS_URL` | no | `wss://api.mistral.ai` | upstream override (tests/mock) |
 | `LLM_BASE_URL` | no | Mistral (`…/v1`) | `/v1/converse`: default chat-completions endpoint |
 | `LLM_API_KEY` | no | `MISTRAL_API_KEY` | key for that endpoint |
-| `OPENROUTER_API_KEY` | no | — | enables `/v1/decide` and the conversation's fast decisions; adds the `openrouter` LLM provider; if `LLM_MODEL` and `LLM_BASE_URL` are unset, it becomes the default with `anthropic/claude-haiku-5.5` |
+| `OPENROUTER_API_KEY` | no | — | enables `/v1/decide` and the conversation's fast decisions; adds the `openrouter` LLM provider (not the default: see `LLM_MODEL`) |
 | `LLM_MODEL` | no | `mistral-small-latest` | default conversation model: `model` or `provider:model` (e.g. `openrouter:anthropic/claude-haiku-5.5`) |
 | `LLM_PROVIDER_<NAME>_BASE_URL` / `_API_KEY` | no | — | extra named LLM endpoints |
 | `LLM_MODELS` | no | — | models clients may pick: `model` or `provider:model`, comma-separated; `*` = any |

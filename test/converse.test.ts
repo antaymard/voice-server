@@ -611,11 +611,12 @@ test("raw pcm is recognized as 16-bit or float and always leaves as 16-bit", () 
   assert.deepEqual(Buffer.concat(kept.filter((b): b is Buffer => b !== null)), asInt);
 });
 
-test("an OpenRouter key alone selects OpenRouter; LLM_MODEL still decides when set", () => {
+test("an OpenRouter key adds a provider without changing the default model", () => {
   const base = { MISTRAL_API_KEY: "m", AUTH_TOKEN: "x".repeat(32), ALLOWED_ORIGINS: "*", OPENROUTER_API_KEY: "or-key" };
   const auto = loadConfig(base);
   assert.deepEqual(auto.llmProviders["openrouter"], { baseUrl: "https://openrouter.ai/api/v1", apiKey: "or-key" });
-  assert.deepEqual([auto.llmDefaultProvider, auto.llmModel], ["openrouter", "anthropic/claude-haiku-5.5"]);
+  assert.deepEqual([auto.llmDefaultProvider, auto.llmModel], ["default", "mistral-small-latest"]);
+  assert.equal(auto.deciderApiKey, "or-key"); // the decision model still comes with the key
 
   const pinned = loadConfig({ ...base, LLM_MODEL: "openrouter:openai/gpt-x" });
   assert.deepEqual([pinned.llmDefaultProvider, pinned.llmModel], ["openrouter", "openai/gpt-x"]);
