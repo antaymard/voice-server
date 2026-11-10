@@ -3,7 +3,16 @@ import { cors } from "hono/cors";
 import { bodyLimit } from "hono/body-limit";
 import { serveStatic } from "@hono/node-server/serve-static";
 import type { Mistral } from "@mistralai/mistralai";
-import { bearerToken, isOriginAllowed, safeEqual } from "./auth.ts";
+import {
+  authorize,
+  bearerToken,
+  DEFAULT_SESSION_TOKEN_TTL_SEC,
+  isOriginAllowed,
+  mintSessionToken,
+  scopeForPath,
+  SCOPES,
+  type Scope,
+} from "./auth.ts";
 import type { Config } from "./config.ts";
 import { createTranscribeHandler } from "./transcribe.ts";
 import { createSynthesizeHandler } from "./synthesize.ts";
@@ -67,11 +76,44 @@ export function createApp(config: Config, deps: AppDeps): Hono {
   );
 
   app.use("/v1/*", async (c, next) => {
-    const token = bearerToken(c.req.header("authorization"));
-    if (!token || !safeEqual(token, config.authToken)) {
-      return c.json({ error: { code: "unauthorized", message: "Missing or invalid bearer token" } }, 401);
-    }
+    // Unknown paths are checked against the master token, then fall through to the 404.
+    const need = scopeForPath(c.req.path) ?? "master";
+    const auth = authorize(bearerToken(c.req.header("authorization")), config.authToken, need);
+    if (!auth.ok) return c.json({ error: { code: auth.code, message: auth.message } }, auth.status);
     await next();
+  });
+
+  // Mint a short-lived session token for a browser (master token only).
+  app.post("/v1/tokens", async (c) => {
+    const badRequest = (message: string) => c.json({ error: { code: "bad_request", message } }, 400);
+    let body: Record<string, unknown>;
+    try {
+      const parsed: unknown = await c.req.json();
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("not an object");
+      body = parsed as Record<string, unknown>;
+    } catch {
+      return badRequest("Body must be a JSON object");
+    }
+    const { scopes, subject, ttl_seconds: ttl } = body;
+    if (!Array.isArray(scopes) || scopes.length === 0 || !scopes.every((s) => (SCOPES as readonly unknown[]).includes(s))) {
+      return badRequest(`\`scopes\` must be a non-empty array among: ${SCOPES.join(", ")}`);
+    }
+    if (subject !== undefined && (typeof subject !== "string" || subject.length === 0 || subject.length > 200)) {
+      return badRequest("`subject` must be a string of 1 to 200 characters");
+    }
+    const max = config.sessionTokenMaxTtlSec;
+    if (ttl !== undefined && (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > max)) {
+      return badRequest(`\`ttl_seconds\` must be an integer between 1 and ${max}`);
+    }
+    const lifetime = (ttl as number | undefined) ?? Math.min(DEFAULT_SESSION_TOKEN_TTL_SEC, max);
+    const expiresAt = Math.floor(Date.now() / 1000) + lifetime;
+    const granted = [...new Set(scopes as Scope[])];
+    return c.json({
+      token: mintSessionToken({ subject: (subject as string | undefined) ?? null, scopes: granted, expiresAt }, config.authToken),
+      expires_at: new Date(expiresAt * 1000).toISOString(),
+      scopes: granted,
+      subject: subject ?? null,
+    });
   });
 
   const uploadLimit = bodyLimit({

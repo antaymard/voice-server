@@ -9,6 +9,7 @@ export function makeConfig(overrides: Partial<Config> = {}): Config {
     port: 0,
     mistralApiKey: "mock-api-key",
     authToken: TEST_TOKEN,
+    sessionTokenMaxTtlSec: 3600,
     allowedOrigins: "*",
     batchModel: "voxtral-mini-transcribe-3-0",
     realtimeModel: "voxtral-mini-transcribe-realtime-3-0",

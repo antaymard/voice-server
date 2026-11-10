@@ -12,6 +12,8 @@ export type Config = {
   port: number;
   mistralApiKey: string;
   authToken: string;
+  /** Longest lifetime `POST /v1/tokens` may grant a session token. */
+  sessionTokenMaxTtlSec: number;
   /** Allowed browser origins, or "*" to disable the check (dev only). */
   allowedOrigins: string[] | "*";
   batchModel: string;
@@ -264,6 +266,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     port: intEnv(env, "PORT", 3000),
     mistralApiKey: env["MISTRAL_API_KEY"] as string,
     authToken,
+    sessionTokenMaxTtlSec: intEnv(env, "SESSION_TOKEN_MAX_TTL_SEC", 60 * 60),
     allowedOrigins,
     batchModel: env["BATCH_MODEL"] || "voxtral-mini-transcribe-3-0",
     realtimeModel: env["REALTIME_MODEL"] || "voxtral-mini-transcribe-realtime-3-0",

@@ -3,7 +3,7 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { RealtimeTranscription } from "@mistralai/mistralai/extra/realtime";
 import { CLOSE_SHUTDOWN, type ServerErrorEvent } from "../../client/src/protocol.ts";
-import { bearerToken, isOriginAllowed, safeEqual } from "../auth.ts";
+import { authorize, bearerToken, isOriginAllowed, scopeForPath } from "../auth.ts";
 import type { Config } from "../config.ts";
 import type { GladiaClient } from "../gladia/client.ts";
 import { runGladiaSession } from "../gladia/bridge.ts";
@@ -81,8 +81,9 @@ export function attachRealtime(
       rejectUpgrade(socket, 503, "server is shutting down");
       return;
     }
-    if (!token || !safeEqual(token, config.authToken)) {
-      rejectUpgrade(socket, 401, token ? "invalid token" : "missing token");
+    const auth = authorize(token, config.authToken, scopeForPath(pathname) ?? "master");
+    if (!auth.ok) {
+      rejectUpgrade(socket, auth.status, auth.message);
       return;
     }
     if (!isOriginAllowed(req.headers.origin, config.allowedOrigins, req.headers.host)) {
@@ -93,6 +94,8 @@ export function attachRealtime(
       rejectUpgrade(socket, 429, `session limit reached (MAX_SESSIONS=${config.maxSessions})`);
       return;
     }
+    // Who is using what: the only trace of per-user usage this server keeps.
+    if (auth.subject) console.log(`[realtime] ${pathname} opened for "${auth.subject}"`);
     wss.handleUpgrade(req, socket, head, (ws) => {
       sessions.add(ws);
       alive.set(ws, true);
