@@ -20,6 +20,11 @@ with optional [Gladia](https://docs.gladia.io)-backed alternatives.
   latency-tuned (`pcm` streaming for the fastest time-to-first-audio), with
   inline **emotion/pace tags**, an expressiveness dial, custom pronunciation
   and conversation-aware delivery. `GET /v1/voices` lists the 36 preset voices.
+- **Live conversation** (`/v1/converse`): talk to a model that answers out
+  loud and **acts while you speak** — Voxtral listens and speaks, and the
+  model in between is **any chat-completions LLM**, swappable per
+  conversation. Interruptible, starts thinking before you finish, and its
+  tools run in your app. See [Live conversation](#live-conversation-websocket--get-v1converse).
 - **Gladia alternatives** (`/v1/gladia/*`, opt-in via `GLADIA_API_KEY`):
   live and bulk STT with business vocabulary biasing, context prompts,
   speaker-count-aware diarization, summaries/chapters/subtitles, and async
@@ -343,7 +348,7 @@ No auth. `{ "ok": true, "uptime": 123, "activeSessions": 0, "media": { "enabled"
 ### `GET /`
 
 Demo page (mic realtime + file upload). Static and public; API calls made from
-it still need the token.
+it still need the token. `/converse.html` is the live-conversation demo.
 
 ## Realtime WebSocket — `GET /v1/realtime`
 
@@ -399,6 +404,93 @@ Notes: deltas can still arrive after a `turn.end`; wait for `turn` `end`
 (not `eager_end`) before anything irreversible. The server pings every 30 s; sessions are capped
 by `MAX_SESSION_MS` (a graceful finalize is attempted first) and reaped after
 `IDLE_TIMEOUT_MS` without client frames.
+
+## Live conversation WebSocket — `GET /v1/converse`
+
+A voice loop built from three replaceable parts: Voxtral realtime
+transcription (with turn detection) → an LLM that decides and calls tools →
+Voxtral TTS, sentence by sentence. Connect to
+`wss://your-server/v1/converse?token=<AUTH_TOKEN>`; types and validation
+live in [`client/src/converseProtocol.ts`](client/src/converseProtocol.ts),
+and [`public/converse.js`](public/converse.js) is a complete plain-JS client
+(mic, gapless playback, tools).
+
+What the server does for you:
+
+- **Thinks ahead.** On `eager_end` (the user has probably finished) the reply
+  starts being prepared, but nothing is sent until `end` confirms the turn;
+  if the user resumes, the work is thrown away.
+- **Acts while the user speaks.** Tools declared `speculative` (read-only)
+  are called during that early phase; tools with side effects wait for the
+  turn to be final.
+- **Can be interrupted.** When the user speaks over the assistant, generation
+  and speech stop, and the model's memory keeps only what was actually heard.
+- **Doesn't block on slow tools.** A call that outlives `toolTimeoutMs` (or an
+  interruption) keeps running in your app; the model says it's in progress,
+  and reports the result when your `tool_result` arrives.
+
+**Client → server**
+
+1. A `start` text frame — every field optional:
+
+   | Field | Default | Notes |
+   |---|---|---|
+   | `sampleRate`, `targetDelayMs`, `language`, `contextBias`, `turnDetection` | as `/v1/realtime` | transcription settings (turn detection is always on) |
+   | `instructions` | — | system prompt (the server adds "you are speaking: no markdown, be brief") |
+   | `tools` | `[]` | `[{ name, description?, parameters? (JSON Schema), speculative? }]`, max 32 |
+   | `history` | `[]` | `[{ role: "user" \| "assistant", content }]` to resume a conversation |
+   | `provider`, `model` | server default | which LLM to use; must be allowed by the server (see below) |
+   | `voice` | `TTS_VOICE` | voice id for the replies |
+   | `bargeIn` | `true` | let the user interrupt by speaking. Turn it off if the mic can hear the speakers: the assistant would interrupt itself |
+   | `speculate` | `true` | prepare the reply on `eager_end` |
+   | `toolTimeoutMs` | `15000` | how long a response waits for a `tool_result` |
+
+2. Binary frames of mic audio (PCM s16le mono, as `/v1/realtime`).
+3. Optional text frames: `{ "type": "tool_result", "callId", "output", "isError?" }`,
+   `{ "type": "text", "text" }` (a typed user message),
+   `{ "type": "interrupt" }` (a "stop talking" button), `{ "type": "stop" }`.
+
+**Server → client** — JSON text frames, plus **binary frames of the
+assistant's speech** (PCM s16le mono 24 kHz, see `ready.audio`):
+
+| Event | Fields | Meaning |
+|---|---|---|
+| `ready` | `requestId, sttModel, ttsModel, llmProvider, llmModel, audio` | start sending audio |
+| `transcript` | `text` | live transcript of the user, append-only |
+| `turn` | `phase` | `start` / `eager_end` / `resume` / `end` |
+| `user_turn` | `text` | the finished turn, as given to the model |
+| `response_start` | `responseId` | binary frames that follow belong to this response |
+| `assistant_delta` | `responseId, text` | reply text (arrives ahead of its audio) |
+| `tool_call` | `responseId, callId, name, arguments, speculative` | run it, answer with `tool_result`. `arguments` is a JSON string written by the model: validate it |
+| `tool_cancel` | `callId` | a speculative call is no longer needed |
+| `response_done` | `responseId, text` | the reply is complete |
+| `interrupt` | `responseId, heardText` | **stop playback and drop queued audio** |
+| `response_error` | `responseId, code, message` | `llm_error` / `tts_error`; the session goes on |
+| `error` | `code, message` | fatal, same codes as `/v1/realtime`, then close |
+
+**Choosing the LLM.** Any endpoint that speaks the OpenAI chat-completions
+protocol with streaming and tool calls works. The default is Mistral
+(`LLM_MODEL`, with your `MISTRAL_API_KEY`). To swap or add models:
+
+```bash
+# Change the default endpoint/model
+LLM_BASE_URL=https://api.groq.com/openai/v1
+LLM_API_KEY=...
+LLM_MODEL=llama-3.3-70b-versatile
+
+# Or keep Mistral as default and add named providers apps can pick per conversation
+LLM_PROVIDER_GROQ_BASE_URL=https://api.groq.com/openai/v1
+LLM_PROVIDER_GROQ_API_KEY=...
+LLM_MODELS=mistral-large-latest,groq:llama-3.3-70b-versatile   # or * for any
+```
+
+A client then sends `{ "type": "start", "provider": "groq", "model": "llama-3.3-70b-versatile" }`.
+Models outside `LLM_MODELS` are refused (close `4400`), so a leaked app token
+can't run up a bill on your most expensive model.
+
+Speech in and out go through two small interfaces as well (`Tts` in
+`src/converse/tts.ts`, `Llm` in `src/converse/llm.ts`); the orchestration is
+in `src/converse/session.ts`.
 
 ## Gladia realtime WebSocket — `GET /v1/gladia/realtime`
 
@@ -494,6 +586,12 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `DEFAULT_TARGET_DELAY_MS` | no | `480` | default latency/accuracy tradeoff (80–1200 or 2400) |
 | `MISTRAL_BASE_URL` | no | `https://api.mistral.ai` | upstream override (tests/mock) |
 | `MISTRAL_WS_URL` | no | `wss://api.mistral.ai` | upstream override (tests/mock) |
+| `LLM_BASE_URL` | no | Mistral (`…/v1`) | `/v1/converse`: default chat-completions endpoint |
+| `LLM_API_KEY` | no | `MISTRAL_API_KEY` | key for that endpoint |
+| `LLM_MODEL` | no | `mistral-small-latest` | default conversation model |
+| `LLM_PROVIDER_<NAME>_BASE_URL` / `_API_KEY` | no | — | extra named LLM endpoints |
+| `LLM_MODELS` | no | — | models clients may pick: `model` or `provider:model`, comma-separated; `*` = any |
+| `CONVERSE_SETTLE_MS` | no | `150` | after a turn ends, wait for late transcript text before answering |
 | `GLADIA_API_KEY` | no | — | enables `/v1/gladia/*`; empty = those endpoints answer 503 |
 | `GLADIA_BULK_MODEL` | no | `solaria-1` | bulk model: `solaria-1` (clean/quiet, 100+ langs) or `solaria-3` (noisy, single language) |
 | `GLADIA_LIVE_MODEL` | no | — | live model override (empty = Gladia's default, solaria-1 — the only model live supports) |
@@ -569,6 +667,11 @@ on :9098 with `GLADIA_API_KEY=any GLADIA_BASE_URL=http://127.0.0.1:9098`).
   `TTS_MODEL=voxtral-mini-tts-2603` (the Voxtral 3–only options then fail upstream).
 - Realtime (Mistral): `diarize` and `turnDetection` are mutually exclusive
   (Mistral limitation); realtime segments carry no timestamps.
+- Live conversation is a first version: no React hook yet (use
+  `public/converse.js` as the reference client), barge-in triggers on
+  Voxtral's `turn.start` (a cough can cut the assistant off), "what was
+  heard" is estimated from audio timing, and replies are spoken through
+  per-sentence `/audio/speech` calls rather than Voxtral TTS Realtime.
 - Not exposed yet: Voxtral TTS Realtime 3 (`voxtral-mini-tts-realtime-3-0`,
   a live-conversation speech stream), TTS style instructions (not available
   at Mistral's launch), and Mistral's managed Voice Agents.

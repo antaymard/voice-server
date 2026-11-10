@@ -5,6 +5,9 @@ import { join, resolve } from "node:path";
 export const SPEECH_FORMATS = ["pcm", "wav", "mp3", "flac", "opus"] as const;
 export type SpeechFormat = (typeof SPEECH_FORMATS)[number];
 
+/** An OpenAI-compatible chat-completions endpoint. */
+export type LlmProvider = { baseUrl: string; apiKey: string };
+
 export type Config = {
   port: number;
   mistralApiKey: string;
@@ -27,6 +30,18 @@ export type Config = {
   defaultTargetDelayMs: number;
   mistralBaseUrl: string;
   mistralWsUrl: string;
+  /**
+   * LLM endpoints for /v1/converse, by name. "default" always exists (Mistral
+   * unless LLM_BASE_URL says otherwise); others come from
+   * LLM_PROVIDER_<NAME>_BASE_URL / _API_KEY.
+   */
+  llmProviders: Record<string, LlmProvider>;
+  /** Model used when a conversation doesn't ask for one (default provider). */
+  llmModel: string;
+  /** What a client may pick per conversation besides the default; "*" = anything. */
+  llmAllowedModels: "*" | { provider: string; model: string }[];
+  /** After a turn ends, wait this long for late transcript text before answering. */
+  converseSettleMs: number;
   /** Gladia API key; "" disables the /v1/gladia/* endpoints. */
   gladiaApiKey: string;
   gladiaBaseUrl: string;
@@ -115,6 +130,49 @@ function parseHostList(raw: string | undefined): string[] {
     });
 }
 
+const PROVIDER_ENV = /^LLM_PROVIDER_([A-Z0-9_]+)_BASE_URL$/;
+
+function loadLlmProviders(
+  env: Record<string, string | undefined>,
+): Record<string, LlmProvider> {
+  const providers: Record<string, LlmProvider> = {
+    default: {
+      baseUrl: (env["LLM_BASE_URL"] || `${env["MISTRAL_BASE_URL"] || "https://api.mistral.ai"}/v1`).replace(/\/$/, ""),
+      apiKey: env["LLM_API_KEY"] || env["MISTRAL_API_KEY"] || "",
+    },
+  };
+  for (const [key, value] of Object.entries(env)) {
+    const match = PROVIDER_ENV.exec(key);
+    if (!match || !value) continue;
+    const name = (match[1] as string).toLowerCase();
+    const apiKey = env[`LLM_PROVIDER_${match[1]}_API_KEY`];
+    if (!apiKey) throw new Error(`${key} is set but LLM_PROVIDER_${match[1]}_API_KEY is missing`);
+    providers[name] = { baseUrl: value.replace(/\/$/, ""), apiKey };
+  }
+  return providers;
+}
+
+/** Entries are `model` (default provider) or `provider:model`; `*` allows anything. */
+function parseAllowedModels(
+  raw: string | undefined,
+  providers: Record<string, LlmProvider>,
+): "*" | { provider: string; model: string }[] {
+  if (!raw) return [];
+  if (raw.trim() === "*") return "*";
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      // Model ids can contain ":" themselves (e.g. "llama3:8b"): only a known
+      // provider name counts as a prefix.
+      const colon = entry.indexOf(":");
+      const prefix = colon > 0 ? entry.slice(0, colon).toLowerCase() : "";
+      if (prefix && providers[prefix]) return { provider: prefix, model: entry.slice(colon + 1) };
+      return { provider: "default", model: entry };
+    });
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const missing = ["MISTRAL_API_KEY", "AUTH_TOKEN", "ALLOWED_ORIGINS"].filter((k) => !env[k]);
   if (missing.length > 0) {
@@ -151,6 +209,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     }
   }
 
+  const llmProviders = loadLlmProviders(env);
+
   return {
     port: intEnv(env, "PORT", 3000),
     mistralApiKey: env["MISTRAL_API_KEY"] as string,
@@ -169,6 +229,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     defaultTargetDelayMs: intEnv(env, "DEFAULT_TARGET_DELAY_MS", 480),
     mistralBaseUrl: env["MISTRAL_BASE_URL"] || "https://api.mistral.ai",
     mistralWsUrl: env["MISTRAL_WS_URL"] || "wss://api.mistral.ai",
+    llmProviders,
+    llmModel: env["LLM_MODEL"] || "mistral-small-latest",
+    llmAllowedModels: parseAllowedModels(env["LLM_MODELS"], llmProviders),
+    converseSettleMs: intEnv(env, "CONVERSE_SETTLE_MS", 150),
     gladiaApiKey: env["GLADIA_API_KEY"] || "",
     gladiaBaseUrl: (env["GLADIA_BASE_URL"] || "https://api.gladia.io").replace(/\/$/, ""),
     gladiaBulkModel,

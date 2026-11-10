@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>voice-server — live conversation</title>
+  <style>
+    :root { color-scheme: dark; --accent: #1f6feb; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 2rem 1rem; min-height: 100vh;
+      background: #0d1117; color: #e6edf3;
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      display: flex; justify-content: center;
+    }
+    main { width: 100%; max-width: 720px; }
+    h1 { font-size: 1.3rem; margin: 0 0 0.25rem; }
+    h2 { font-size: 0.95rem; margin: 0 0 0.75rem; color: #8b949e; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+    p.sub { color: #8b949e; margin: 0 0 1.5rem; font-size: 0.9rem; }
+    a { color: #58a6ff; }
+    section { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 1.25rem; margin-bottom: 1.25rem; }
+    label { display: block; font-size: 0.8rem; color: #8b949e; margin-bottom: 0.25rem; }
+    label.check { display: flex; align-items: center; gap: 0.4rem; color: #e6edf3; font-size: 0.85rem; margin: 0; }
+    input[type="text"], input[type="password"], textarea {
+      width: 100%; padding: 0.5rem 0.65rem; border-radius: 6px;
+      border: 1px solid #30363d; background: #0d1117; color: #e6edf3; font-size: 0.9rem; font-family: inherit;
+    }
+    textarea { resize: vertical; min-height: 4rem; }
+    .row { display: flex; gap: 0.75rem; margin-bottom: 0.9rem; flex-wrap: wrap; align-items: end; }
+    .row > div { flex: 1; min-width: 140px; }
+    button {
+      padding: 0.55rem 1.1rem; border-radius: 6px; border: 1px solid #30363d;
+      background: #21262d; color: #e6edf3; font-size: 0.9rem; cursor: pointer;
+    }
+    button.primary { background: var(--accent); border-color: var(--accent); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .status { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; color: #8b949e; margin-left: 0.75rem; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #484f58; }
+    .dot.live { background: #3fb950; box-shadow: 0 0 6px #3fb950; animation: pulse 1.2s infinite; }
+    .dot.err { background: #f85149; }
+    @keyframes pulse { 50% { opacity: 0.4; } }
+    .log { display: flex; flex-direction: column; gap: 0.5rem; min-height: 8rem; margin-top: 1rem; }
+    .msg { padding: 0.55rem 0.8rem; border-radius: 10px; max-width: 85%; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .msg.user { align-self: flex-end; background: var(--accent); }
+    .msg.user.live { opacity: 0.6; }
+    .msg.assistant { align-self: flex-start; background: #21262d; }
+    .msg.assistant.cut { border-left: 3px solid #d29922; }
+    .msg.tool { align-self: flex-start; background: none; border: 1px dashed #30363d; color: #8b949e; font-size: 0.8rem; font-family: ui-monospace, monospace; }
+    .meta { font-size: 0.78rem; color: #8b949e; margin-top: 0.75rem; min-height: 1.1em; }
+    ul { margin: 0; padding-left: 1.2rem; }
+    ul:empty::before { content: "No notes yet — ask the assistant to write one down."; color: #484f58; margin-left: -1.2rem; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Live conversation</h1>
+    <p class="sub">Talk to a model that listens, answers out loud and acts on this page while you speak. Use headphones, or untick “interrupt by speaking”. <a href="/">Back to the transcription demo</a></p>
+
+    <section>
+      <h2>Setup</h2>
+      <div class="row">
+        <div>
+          <label for="token">Server token (AUTH_TOKEN)</label>
+          <input type="password" id="token" autocomplete="off" />
+        </div>
+        <div>
+          <label for="language">Language (optional)</label>
+          <input type="text" id="language" placeholder="auto-detect, or e.g. fr" maxlength="2" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="provider">LLM provider (optional)</label>
+          <input type="text" id="provider" placeholder="default" />
+        </div>
+        <div>
+          <label for="model">LLM model (optional)</label>
+          <input type="text" id="model" placeholder="server default" />
+        </div>
+        <div>
+          <label for="voice">Voice id (optional)</label>
+          <input type="text" id="voice" placeholder="server default" />
+        </div>
+      </div>
+      <label for="instructions">Instructions</label>
+      <textarea id="instructions">You are a friendly assistant living in a demo page. You can change the page's accent color, keep a list of notes for the user, and tell the time.</textarea>
+      <div class="row" style="margin: 0.9rem 0 0">
+        <label class="check"><input type="checkbox" id="bargeIn" checked /> Interrupt by speaking</label>
+        <label class="check"><input type="checkbox" id="speculate" checked /> Start thinking before I finish</label>
+      </div>
+    </section>
+
+    <section>
+      <h2>Conversation</h2>
+      <button id="start" class="primary">Start talking</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="hush" disabled>Hush</button>
+      <span class="status"><span class="dot" id="dot"></span><span id="status">idle</span></span>
+      <div class="log" id="log"></div>
+      <div class="row" style="margin: 1rem 0 0">
+        <div><input type="text" id="typed" placeholder="…or type a message" disabled /></div>
+      </div>
+      <div class="meta" id="meta"></div>
+    </section>
+
+    <section>
+      <h2>Notes (written by the assistant)</h2>
+      <ul id="notes"></ul>
+    </section>
+  </main>
+  <script src="/converse.js"></script>
+</body>
+</html>

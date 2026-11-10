@@ -12,7 +12,8 @@
  *   `transcription.language` on the first audio append, one
  *   `transcription.text.delta` ("p1 ", "p2 ", ...) per append, and
  *   `transcription.done` on `input_audio.end`. An append whose audio decodes
- *   to the ASCII string "KILL" terminates the socket (simulates upstream death).
+ *   to the ASCII string "KILL" terminates the socket (simulates upstream death);
+ *   "TURN:<phase>" / "SAY:<text>" script a turn event / a transcript delta.
  *   Voxtral 3: with `diarize`, each append yields a `transcription.segment`
  *   (speaker_1, null timestamps) instead of a delta; with `turn_detection`,
  *   `turn.start` precedes the first delta and `turn.end` precedes `done`;
@@ -234,6 +235,17 @@ export function startMockMistral(port = 0): Promise<MockMistral> {
           const audio = Buffer.from(String(msg.audio ?? ""), "base64");
           if (audio.toString("utf8") === "KILL") {
             ws.terminate();
+            return;
+          }
+          // Scripted conversations (for /v1/converse tests): "TURN:<phase>"
+          // emits that turn event, "SAY:<text>" emits <text> as a delta.
+          const script = audio.toString("utf8");
+          if (script.startsWith("TURN:")) {
+            ws.send(JSON.stringify({ type: `turn.${script.slice(5)}`, time_s: 1 }));
+            return;
+          }
+          if (script.startsWith("SAY:")) {
+            ws.send(JSON.stringify({ type: "transcription.text.delta", text: script.slice(4) }));
             return;
           }
           appendCount += 1;
