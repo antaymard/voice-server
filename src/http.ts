@@ -10,6 +10,7 @@ import { createSynthesizeHandler } from "./synthesize.ts";
 import { createVoicesHandler } from "./voices.ts";
 import type { GladiaClient } from "./gladia/client.ts";
 import { createGladiaResultHandler, createGladiaTranscribeHandler } from "./gladia/transcribe.ts";
+import { createDecideHandler, type Decider } from "./decide.ts";
 import type { MediaJobs } from "./media/jobs.ts";
 import { registerMediaRoutes } from "./media/routes.ts";
 
@@ -18,6 +19,8 @@ export type AppDeps = {
   /** null when GLADIA_API_KEY is not configured (endpoints answer 503). */
   gladia: GladiaClient | null;
   activeSessions: () => number;
+  /** null when no decision-model key is configured (/v1/decide answers 503). */
+  decider?: Decider | null;
   /** Audio-parts jobs; absent or disabled -> /v1/media/* answer 503. */
   media?: MediaJobs | null;
 };
@@ -96,6 +99,9 @@ export function createApp(config: Config, deps: AppDeps): Hono {
   // (`ref_audio`, `conversation_history`).
   app.post("/v1/speak", uploadLimit, createSynthesizeHandler(deps.batch, config));
   app.get("/v1/voices", createVoicesHandler(deps.batch));
+
+  // Typed decisions from a "System One" model (yes/no, choice, score).
+  app.post("/v1/decide", uploadLimit, createDecideHandler(deps.decider ?? null));
 
   // Long-file preparation for transcription (ffmpeg; no STT here).
   registerMediaRoutes(app, config, deps.media ?? null);

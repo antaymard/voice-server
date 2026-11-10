@@ -17,6 +17,11 @@
  *   shown what they have said so far and may already call the tools declared
  *   `immediate` (or `speculative`). What it did is handed to the reply that
  *   follows, so nothing is done twice.
+ * - Fast decisions: when a decision ("System One") model is configured, it
+ *   settles in tens of milliseconds the calls that are judgment rather than
+ *   writing: is this an interruption, an acknowledgement or an echo; was the
+ *   sentence left hanging; is there already something to act on. Each has a
+ *   rule of thumb to fall back on if the model is absent, slow or failing.
  * - Tools don't block the conversation: a call that outlives its response
  *   (timeout or interruption) keeps running client-side, and its result is
  *   picked up when it arrives.
@@ -43,12 +48,19 @@ import {
   type TurnPhase,
 } from "../../client/src/protocol.ts";
 import type { Config } from "../config.ts";
+import type { Decider, DecisionAnswer, DecisionQuestion } from "../decide.ts";
 import { toSessionUpdate } from "../realtime/bridge.ts";
 import { connectTranscription, rawDataToBuffer, type Transcription } from "../realtime/upstream.ts";
 import { resolveLlm, type ChatMessage, type Llm, type ToolCall } from "./llm.ts";
 import { TTS_BYTES_PER_SECOND, TTS_SAMPLE_RATE, type Tts, type TtsStream } from "./tts.ts";
 
-export type ConverseDeps = { realtime: RealtimeTranscription; llm: Llm; tts: Tts };
+export type ConverseDeps = {
+  realtime: RealtimeTranscription;
+  llm: Llm;
+  tts: Tts;
+  /** null: no decision model configured, the session uses its rules of thumb. */
+  decider: Decider | null;
+};
 
 const MAX_CLIENT_BUFFERED_BYTES = 8 * 1024 * 1024;
 /** LLM turns per response (each tool round-trip costs one). */
@@ -82,6 +94,46 @@ const EARLY_MIN_NEW_WORDS = 4;
 /** …and a clause boundary, or this many words without one. */
 const EARLY_MAX_NEW_WORDS = 10;
 const CLAUSE_BOUNDARY = /[,;:.!?…]/;
+/** With a decision model as gatekeeper, looking is cheap: do it this often. */
+const GATED_MIN_NEW_WORDS = 2;
+/** Below this probability of "the user has finished", the turn is held open… */
+const UNFINISHED_BELOW = 0.3;
+/** …for this long, in case they pick their sentence back up. */
+const HOLD_OPEN_MS = 1200;
+
+const INTENT_QUESTION: DecisionQuestion = {
+  type: "choice",
+  instructions:
+    "A voice assistant is speaking out loud. Its microphone picked up `microphone_heard` meanwhile. What is it?",
+  criteria: {
+    interrupt:
+      "The user is talking to the assistant: a new request, a question, a correction, a disagreement, or asking it to stop or wait.",
+    backchannel:
+      "The user is only showing they are listening (yes, ok, right, I see, mm-hm): the assistant should keep talking.",
+    echo: "The microphone caught the assistant's own voice: the words repeat part of `assistant_is_saying`.",
+  },
+};
+
+const FINISHED_QUESTION: DecisionQuestion = {
+  type: "noul",
+  instructions:
+    "In a spoken conversation, the user paused after saying `user_said`. Have they finished what they wanted to say?",
+  criteria: {
+    true: "The utterance is complete: a whole request, question, answer or remark that can be responded to.",
+    false:
+      "The sentence is left hanging: it stops mid-phrase, ends on a filler or a connective (and, but, so, uh…), or is missing the part that would make it actionable.",
+  },
+};
+
+const ACTIONABLE_QUESTION: DecisionQuestion = {
+  type: "noul",
+  instructions:
+    "The user is still speaking; `user_is_saying` is their sentence so far. Does it already contain a complete, unambiguous instruction that one of `tools` can carry out right now, and that is not in `already_done`?",
+  criteria: {
+    true: "Yes: a specific action is fully stated (what to do and with which values), whatever the user says next.",
+    false: "No: nothing to do yet, the instruction is still incomplete or ambiguous, or it was already done.",
+  },
+};
 
 const PENDING_TOOL_OUTPUT = JSON.stringify({
   status: "pending",
@@ -238,6 +290,40 @@ export function runConverseSession(
   let earlyPass: AbortController | null = null;
   /** Words of the turn the model has already looked at. */
   let wordsSeenEarly = 0;
+  /** Same, for the last look that actually went to the LLM. */
+  let wordsSeenByLlm = 0;
+  /** A decision on the held (suspect) turn is in flight; a turn end waits for it. */
+  let reviewing = false;
+  let commitAfterReview = false;
+  /** "Has the user finished?", asked ahead of the turn's end, for a given text. */
+  let completeness: { text: string; verdict: Promise<number | null> } | null = null;
+  /** The turn's end was put off once already, waiting for the user to go on. */
+  let heldOpen = false;
+  let deciderWarned = false;
+
+  const deciding = (): boolean => deps.decider !== null && params?.decide === true;
+
+  /** One decision, or null when there is no decider, it is slow, or it failed. */
+  const ask = async (question: DecisionQuestion, state: unknown): Promise<DecisionAnswer | null> => {
+    if (!deps.decider || !deciding()) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), config.deciderTimeoutMs);
+    try {
+      const { answers } = await deps.decider({ state, questions: { q: question }, signal: controller.signal });
+      return answers["q"] ?? null;
+    } catch (err) {
+      if (!deciderWarned) {
+        deciderWarned = true; // once per conversation is enough
+        console.warn(
+          `[converse] decision model ${controller.signal.aborted ? `slower than ${config.deciderTimeoutMs}ms` : "failed"}; using rules of thumb:`,
+          controller.signal.aborted ? "" : err,
+        );
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
   const finish = (code: number, reason: string): void => {
     if (finished) return;
@@ -333,6 +419,7 @@ export function runConverseSession(
     earlyPass?.abort();
     earlyPass = null;
     wordsSeenEarly = 0;
+    wordsSeenByLlm = 0;
     const messages = actionMessages();
     // Still running: their results will come in as late results.
     for (const action of turnActions) {
@@ -655,6 +742,7 @@ export function runConverseSession(
     heldEvents = [];
     userBuffer = "";
     wordsSeenEarly = 0;
+    wordsSeenByLlm = 0;
   };
 
   /** Tools the model may use before the user has finished speaking. */
@@ -670,6 +758,7 @@ export function runConverseSession(
     earlyPass = controller;
     const text = userBuffer.trim();
     wordsSeenEarly = wordsOf(text).length;
+    wordsSeenByLlm = wordsSeenEarly;
     try {
       const calls: ToolCall[] = [];
       const stream = deps.llm({
@@ -718,31 +807,122 @@ export function runConverseSession(
     }
   };
 
+  /** Ask the decision model whether there is something to act on; wake the LLM only if so. */
+  const gateEarlyLook = async (): Promise<void> => {
+    const controller = new AbortController();
+    earlyPass = controller;
+    const total = wordsOf(userBuffer).length;
+    wordsSeenEarly = total;
+    const answer = await ask(ACTIONABLE_QUESTION, {
+      user_is_saying: userBuffer.trim(),
+      tools: earlyTools().map(({ name, description }) => ({ name, description })),
+      already_done: turnActions.map((a) => `${a.call.function.name}(${a.call.function.arguments})`),
+    });
+    if (controller.signal.aborted || finished) return;
+    earlyPass = null;
+    const go =
+      answer?.type === "noul"
+        ? answer.noul >= 0.5
+        : total - wordsSeenByLlm >= EARLY_MAX_NEW_WORDS; // no verdict: fall back to looking now and then
+    if (go && !current && !suspect) void lookEarly();
+    else considerEarlyLook("");
+  };
+
   function considerEarlyLook(delta: string): void {
     if (finished || suspect || current || earlyPass || earlyTools().length === 0) return;
     const fresh = wordsOf(userBuffer).length - wordsSeenEarly;
-    if (fresh >= EARLY_MAX_NEW_WORDS || (fresh >= EARLY_MIN_NEW_WORDS && CLAUSE_BOUNDARY.test(delta))) {
+    if (deciding()) {
+      if (fresh >= GATED_MIN_NEW_WORDS) void gateEarlyLook();
+    } else if (fresh >= EARLY_MAX_NEW_WORDS || (fresh >= EARLY_MIN_NEW_WORDS && CLAUSE_BOUNDARY.test(delta))) {
       void lookEarly();
     }
   }
 
+  /** Is the held turn the user speaking to us? */
   const reviewSuspect = (): void => {
-    if (suspect && classifyEcho(userBuffer, audible?.text ?? "") === "speech") confirmTurn();
+    if (!suspect) return;
+    const said = audible?.text ?? "";
+    const rule = classifyEcho(userBuffer, said);
+    if (rule === "unknown") return; // no words yet
+    if (!deciding()) {
+      if (rule === "speech") confirmTurn();
+      return;
+    }
+    if (reviewing) return; // re-checked when the pending decision lands
+    const heard = userBuffer;
+    reviewing = true;
+    void ask(INTENT_QUESTION, { assistant_is_saying: said, microphone_heard: heard.trim() }).then((answer) => {
+      reviewing = false;
+      if (finished) return;
+      if (suspect) {
+        const interrupts =
+          answer?.type === "choice"
+            ? answer.choice === "interrupt"
+            : classifyEcho(userBuffer, audible?.text ?? "") === "speech";
+        if (interrupts) confirmTurn();
+        else if (userBuffer !== heard) reviewSuspect(); // more words came in meanwhile
+      }
+      if (commitAfterReview && !reviewing) {
+        commitAfterReview = false;
+        commitTurn();
+      }
+    });
+  };
+
+  /** Ask ahead whether the user's sentence, as it stands, is complete. */
+  const askCompleteness = (): void => {
+    const text = userBuffer.trim();
+    if (!deciding() || suspect || !text || completeness?.text === text) return;
+    const last = history[history.length - 1];
+    completeness = {
+      text,
+      verdict: ask(FINISHED_QUESTION, {
+        ...(last?.role === "assistant" && last.content ? { assistant_said_before: last.content } : {}),
+        user_said: text,
+      }).then((answer) => (answer?.type === "noul" ? answer.noul : null)),
+    };
+  };
+
+  const finalizeTurn = (text: string): void => {
+    userBuffer = "";
+    heldOpen = false;
+    completeness = null;
+    send({ type: "user_turn", text });
+    if (current && !current.committed && current.userText === text) commit(current);
+    else startResponse(text, true);
   };
 
   const commitTurn = (): void => {
     settleTimer = null;
+    if (suspect && reviewing) {
+      commitAfterReview = true; // let the decision on this turn land first
+      return;
+    }
     if (suspect) dropTurn(); // never turned into speech
     const text = userBuffer.trim();
-    userBuffer = "";
     if (!text) {
+      userBuffer = "";
+      heldOpen = false;
       if (current && !current.committed) discardSpeculative(current);
       followUpIfIdle(); // a noise opened the turn: don't sit on a finished tool
       return;
     }
-    send({ type: "user_turn", text });
-    if (current && !current.committed && current.userText === text) commit(current);
-    else startResponse(text, true);
+    if (heldOpen || completeness?.text !== text) {
+      finalizeTurn(text);
+      return;
+    }
+    // A sentence left hanging gets a little more time before we answer it.
+    void completeness.verdict.then((finishedProbability) => {
+      if (finished || turnOpen || settleTimer) return; // the turn moved on without us
+      if (userBuffer.trim() !== text) {
+        commitTurn(); // late words: judge the new text
+      } else if (finishedProbability !== null && finishedProbability < UNFINISHED_BELOW) {
+        heldOpen = true;
+        settleTimer = setTimeout(commitTurn, HOLD_OPEN_MS);
+      } else {
+        finalizeTurn(text);
+      }
+    });
   };
 
   const armSettle = (): void => {
@@ -780,6 +960,8 @@ export function runConverseSession(
     switch (phase) {
       case "start":
         turnOpen = true;
+        commitAfterReview = false;
+        heldOpen = false;
         if (settleTimer) {
           // The user went on before we answered: same turn, keep listening.
           clearTimeout(settleTimer);
@@ -788,6 +970,7 @@ export function runConverseSession(
         if (!suspect) stopCurrent();
         return;
       case "eager_end":
+        askCompleteness();
         if (!suspect && params?.speculate && !current && userBuffer.trim()) {
           startResponse(userBuffer.trim(), false);
         }
@@ -800,6 +983,7 @@ export function runConverseSession(
         // The last words can trail the end of the turn: give them a moment
         // to arrive before answering. (Never `flush` here: on Voxtral 3 a
         // flush finalizes the transcription and ends the session.)
+        askCompleteness();
         settleDeadline = Date.now() + config.converseSettleMs * 4;
         armSettle();
         return;
@@ -840,6 +1024,7 @@ export function runConverseSession(
           ttsModel: config.ttsModel,
           llmProvider: llmName,
           llmModel,
+          deciderModel: deciding() ? config.deciderModel : null,
           audio: { encoding: "pcm_s16le", sampleRate: TTS_SAMPLE_RATE, channels: 1 },
         }),
       onDelta: onTranscript,

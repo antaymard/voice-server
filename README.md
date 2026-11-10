@@ -25,6 +25,11 @@ with optional [Gladia](https://docs.gladia.io)-backed alternatives.
   model in between is **any chat-completions LLM**, swappable per
   conversation. Interruptible, starts thinking before you finish, and its
   tools run in your app. See [Live conversation](#live-conversation-websocket--get-v1converse).
+- **Fast decisions** (`/v1/decide`, opt-in via `OPENROUTER_API_KEY`): ask a
+  "System One" decision model (Jev, Liquid d1, Perplexity Decider, …) typed
+  questions about a state — yes/no, one of several choices, a score — and
+  get probabilities back in tens of milliseconds. The live conversation uses
+  it for its own judgment calls.
 - **Gladia alternatives** (`/v1/gladia/*`, opt-in via `GLADIA_API_KEY`):
   live and bulk STT with business vocabulary biasing, context prompts,
   speaker-count-aware diarization, summaries/chapters/subtitles, and async
@@ -105,6 +110,36 @@ entries share the model's context window with the audio: keep the list short
 on long recordings (too long → `400` from Mistral). Uploads above
 `MAX_UPLOAD_BYTES` get `413`; upstream auth problems surface as `502
 upstream_auth` (it's the server's key, not yours).
+
+### `POST /v1/decide` — fast typed decisions
+
+Relays to [OpenRouter's Decisions API](https://openrouter.ai/docs/client-sdks/typescript/sdks/decisions/README.md)
+(requires `OPENROUTER_API_KEY`; otherwise `503 decide_disabled`). The model
+doesn't write text: it answers each question with a typed value and its
+probability. `application/json` body:
+
+| Field | Required | Notes |
+|---|---|---|
+| `state` | yes | what the questions are about: a string or any JSON |
+| `questions` | yes | object of questions, keyed by the name you want the answer under |
+| `model` | no | any OpenRouter decision model; default `DECIDER_MODEL` |
+
+Question types: `noul` (yes/no; `criteria: { true, false }` says what each
+means), `choice` (`criteria: { <option>: <when to pick it> }`), `score`
+(`criteria: [<lowest>, …, <highest>]`). Each takes optional `instructions`.
+
+```bash
+curl -X POST https://your-server/v1/decide \
+  -H "Authorization: Bearer $AUTH_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "state": { "user_said": "je voudrais que tu" },
+        "questions": { "finished": { "type": "noul", "instructions": "Has the user finished their sentence?" } } }'
+# -> { "answers": { "finished": { "type": "noul", "noul": 0.04, "confidence": 0.93 } },
+#      "model": "typesafe/jev-1.13", "provider": "TypeSafe", "usage": {...}, "latencyMs": 112 }
+```
+
+`noul` is the probability of "yes". `latencyMs` is the round trip seen from
+the server, handy to compare models. A question the model declines comes
+back as `{ "type": "refusal" }`.
 
 ### `POST /v1/speak` — text to speech
 
@@ -435,6 +470,14 @@ What the server does for you:
   only counts once it carries words that aren't the assistant's own: its voice
   leaking back through the mic, a cough or a door slam don't cut it off.
   (Keep the browser's `echoCancellation` on as the first line of defense.)
+- **Decides fast.** With a decision model configured (`OPENROUTER_API_KEY`),
+  three judgment calls go to it instead of a rule of thumb: whether speech
+  over the assistant is an interruption, a mere "yes, ok" (it keeps talking)
+  or its own echo; whether a sentence was left hanging (the turn is held
+  open up to 1.2 s instead of being answered half-said); and whether there is
+  already something to act on mid-sentence (the LLM is only woken then, and
+  the check runs every two words instead of at each clause). If the model is
+  slow (`DECIDER_TIMEOUT_MS`) or fails, the rules of thumb take over.
 - **Speaks as it writes.** The reply's text is streamed into Voxtral's
   realtime speech WebSocket word by word, so audio can start before the first
   sentence is finished. If that connection fails, the server falls back to
@@ -458,6 +501,7 @@ What the server does for you:
    | `voice` | `TTS_VOICE` | voice id for the replies |
    | `bargeIn` | `true` | let the user interrupt by speaking. `false` ignores the mic entirely while the assistant speaks |
    | `speculate` | `true` | prepare the reply on `eager_end` |
+   | `decide` | `true` | use the server's decision model for the judgment calls above (`false`: rules of thumb) |
    | `toolTimeoutMs` | `15000` | how long a response waits for a `tool_result` |
 
 2. Binary frames of mic audio (PCM s16le mono, as `/v1/realtime`).
@@ -470,7 +514,7 @@ assistant's speech** (PCM s16le mono 24 kHz, see `ready.audio`):
 
 | Event | Fields | Meaning |
 |---|---|---|
-| `ready` | `requestId, sttModel, ttsModel, llmProvider, llmModel, audio` | start sending audio |
+| `ready` | `requestId, sttModel, ttsModel, llmProvider, llmModel, deciderModel, audio` | start sending audio (`deciderModel` is `null` without a decision model) |
 | `transcript` | `text` | live transcript of the user, append-only |
 | `turn` | `phase` | `start` / `eager_end` / `resume` / `end` |
 | `user_turn` | `text` | the finished turn, as given to the model |
@@ -610,10 +654,14 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `MISTRAL_WS_URL` | no | `wss://api.mistral.ai` | upstream override (tests/mock) |
 | `LLM_BASE_URL` | no | Mistral (`…/v1`) | `/v1/converse`: default chat-completions endpoint |
 | `LLM_API_KEY` | no | `MISTRAL_API_KEY` | key for that endpoint |
-| `OPENROUTER_API_KEY` | no | — | adds the `openrouter` LLM provider; if `LLM_MODEL` and `LLM_BASE_URL` are unset, it becomes the default with `anthropic/claude-haiku-5.5` |
+| `OPENROUTER_API_KEY` | no | — | enables `/v1/decide` and the conversation's fast decisions; adds the `openrouter` LLM provider; if `LLM_MODEL` and `LLM_BASE_URL` are unset, it becomes the default with `anthropic/claude-haiku-5.5` |
 | `LLM_MODEL` | no | `mistral-small-latest` | default conversation model: `model` or `provider:model` (e.g. `openrouter:anthropic/claude-haiku-5.5`) |
 | `LLM_PROVIDER_<NAME>_BASE_URL` / `_API_KEY` | no | — | extra named LLM endpoints |
 | `LLM_MODELS` | no | — | models clients may pick: `model` or `provider:model`, comma-separated; `*` = any |
+| `DECIDER_MODEL` | no | `typesafe/jev-1.13` | decision model for `/v1/decide` and the conversation (any OpenRouter decision model) |
+| `DECIDER_API_KEY` | no | `OPENROUTER_API_KEY` | key for the decision service; empty disables it |
+| `DECIDER_URL` | no | OpenRouter Decisions API | decision service endpoint |
+| `DECIDER_TIMEOUT_MS` | no | `400` | how long a conversation waits for a decision before using its rule of thumb |
 | `CONVERSE_TTS` | no | `realtime` | how `/v1/converse` speaks: `realtime` (text streamed into Mistral's speech WebSocket, falls back to `http` on failure) or `http` (one request per sentence) |
 | `TTS_PCM_ENCODING` | no | `auto` | sample type of Mistral's raw `pcm` output for `/v1/converse`: `auto` (detected), `s16le` or `f32le` |
 | `CONVERSE_SETTLE_MS` | no | `150` | after a turn ends, wait for late transcript text before answering |

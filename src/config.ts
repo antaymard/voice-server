@@ -43,6 +43,16 @@ export type Config = {
   /** What a client may pick per conversation besides the default; "*" = anything. */
   llmAllowedModels: "*" | { provider: string; model: string }[];
   /**
+   * Decision ("System One") model access: OpenRouter's Decisions API by
+   * default. An empty key disables /v1/decide and the conversation's fast
+   * decisions (it then relies on simple rules).
+   */
+  deciderUrl: string;
+  deciderApiKey: string;
+  deciderModel: string;
+  /** A conversation waits at most this long for a decision before using its rule of thumb. */
+  deciderTimeoutMs: number;
+  /**
    * How /v1/converse speaks: "realtime" streams the reply's text into
    * Mistral's speech WebSocket as it is written (falls back to "http" when
    * that fails); "http" makes one speech request per sentence.
@@ -272,6 +282,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     llmDefaultProvider: defaultLlm.provider,
     llmModel: defaultLlm.model,
     llmAllowedModels: parseAllowedModels(env["LLM_MODELS"], llmProviders),
+    deciderUrl: env["DECIDER_URL"] || "https://openrouter.ai/api/alpha/decisions",
+    deciderApiKey: env["DECIDER_API_KEY"] || env["OPENROUTER_API_KEY"] || "",
+    deciderModel: env["DECIDER_MODEL"] || "typesafe/jev-1.13",
+    deciderTimeoutMs: intEnv(env, "DECIDER_TIMEOUT_MS", 400),
     converseTts,
     ttsPcmEncoding,
     converseSettleMs: intEnv(env, "CONVERSE_SETTLE_MS", 150),

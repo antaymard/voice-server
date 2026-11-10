@@ -145,7 +145,9 @@ function handleEvent(ws, ev) {
       player.rate = ev.audio.sampleRate;
       setStatus("listening", "live");
       for (const id of ["stop", "hush", "typed"]) $(id).disabled = false;
-      $("meta").textContent = `${ev.llmProvider} / ${ev.llmModel} · ${ev.sttModel} · ${ev.ttsModel}`;
+      $("meta").textContent =
+        `${ev.llmProvider} / ${ev.llmModel} · ${ev.sttModel} · ${ev.ttsModel}` +
+        (ev.deciderModel ? ` · decisions: ${ev.deciderModel}` : "");
       break;
     case "transcript":
       if (!view.liveUser) view.liveUser = bubble("user live");

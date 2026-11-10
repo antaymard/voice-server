@@ -93,6 +93,13 @@ export type ConverseStartMessage = {
    * (a few per long sentence); has no effect without such tools. Default true.
    */
   actEarly?: boolean;
+  /**
+   * Use the server's fast decision model (when configured) to tell an
+   * interruption from an acknowledgement or an echo, to notice a sentence
+   * left hanging, and to judge when to act mid-sentence. Default true;
+   * `false` falls back to simple rules.
+   */
+  decide?: boolean;
   /** How long a response waits for a `tool_result` before moving on. */
   toolTimeoutMs?: number;
 };
@@ -133,6 +140,8 @@ export type ConverseReadyEvent = {
   ttsModel: string;
   llmProvider: string;
   llmModel: string;
+  /** Decision model in use for this conversation, or null. */
+  deciderModel: string | null;
   /** Format of the binary frames the server sends. */
   audio: { encoding: "pcm_s16le"; sampleRate: number; channels: 1 };
 };
@@ -226,6 +235,7 @@ export type ConverseStartParams = {
   bargeIn: boolean;
   speculate: boolean;
   actEarly: boolean;
+  decide: boolean;
   toolTimeoutMs: number;
 };
 
@@ -329,7 +339,7 @@ export function normalizeConverseStart(
   for (const key of ["language", "instructions", "provider", "model", "voice"]) {
     if (!optionalString(raw[key])) return { error: `\`${key}\` must be a string` };
   }
-  for (const key of ["bargeIn", "speculate", "actEarly"]) {
+  for (const key of ["bargeIn", "speculate", "actEarly", "decide"]) {
     if (!optionalBoolean(raw[key])) return { error: `\`${key}\` must be a boolean` };
   }
   if (raw["contextBias"] !== undefined) {
@@ -388,6 +398,7 @@ export function normalizeConverseStart(
     bargeIn: msg.bargeIn !== false,
     speculate: msg.speculate !== false,
     actEarly: msg.actEarly !== false,
+    decide: msg.decide !== false,
     toolTimeoutMs,
   };
 }
