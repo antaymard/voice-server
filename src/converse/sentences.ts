@@ -1,7 +1,8 @@
 /**
  * Cuts a stream of LLM text into chunks worth sending to the speech model:
  * whole sentences, so the voice keeps a natural prosody, emitted as soon as
- * each one is complete so audio starts before the reply is fully written.
+ * each one is complete so audio starts before the reply is fully written —
+ * and, for the very first chunk, as soon as a clause is.
  */
 
 /** Below this, a "sentence" is glued to the next one ("Oui. Bien sûr."). */
@@ -9,8 +10,18 @@ const MIN_CHARS = 12;
 /** A sentence running longer than this is cut at a comma or a space. */
 const MAX_CHARS = 240;
 
+/**
+ * The first chunk of an utterance may stop at a clause (a comma) once it is
+ * this long: the voice starts on "Je regarde ça," instead of waiting for the
+ * end of a long opening sentence. Later chunks are already queued behind
+ * audio, so they stay whole sentences, which sound better.
+ */
+const FIRST_CLAUSE_MIN_CHARS = 20;
+
 // End punctuation (plus closing quotes/brackets) followed by whitespace, or a line break.
 const BOUNDARY = /[.!?…]+["'»)\]]*\s+|\n+/g;
+// A clause break: comma, semicolon or colon followed by whitespace, or a spaced dash.
+const CLAUSE = /[,;:]\s+|\s[—–]\s+/g;
 
 export type SentenceSplitter = {
   /**
@@ -27,6 +38,7 @@ export type SentenceSplitter = {
 
 export function createSentenceSplitter(): SentenceSplitter {
   let buffer = "";
+  let started = false;
 
   const take = (end: number): string => {
     const chunk = buffer.slice(0, end);
@@ -46,6 +58,18 @@ export function createSentenceSplitter(): SentenceSplitter {
           break;
         }
       }
+      if (!started) {
+        const limit = cut < 0 ? buffer.length : cut;
+        CLAUSE.lastIndex = 0;
+        for (let m = CLAUSE.exec(buffer); m; m = CLAUSE.exec(buffer)) {
+          const end = m.index + m[0].length;
+          if (end >= limit) break;
+          if (buffer.slice(0, end).trim().length >= FIRST_CLAUSE_MIN_CHARS) {
+            cut = end;
+            break;
+          }
+        }
+      }
       if (cut < 0 && buffer.length > MAX_CHARS) {
         const head = buffer.slice(0, MAX_CHARS);
         const soft = Math.max(head.lastIndexOf(", "), head.lastIndexOf("; "), head.lastIndexOf(": "));
@@ -53,7 +77,10 @@ export function createSentenceSplitter(): SentenceSplitter {
       }
       if (cut < 0) return out;
       const chunk = take(cut);
-      if (chunk.trim()) out.push(chunk);
+      if (chunk.trim()) {
+        out.push(chunk);
+        started = true;
+      }
     }
   };
 

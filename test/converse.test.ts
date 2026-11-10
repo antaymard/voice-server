@@ -656,6 +656,22 @@ test("sentence splitter emits complete sentences and glues tiny ones", () => {
   assert.equal(toSpeakable("---"), "");
 });
 
+test("sentence splitter lets the first chunk go at a clause, and only the first", () => {
+  const s = createSentenceSplitter();
+  assert.deepEqual(s.push("Je regarde le canvas, et je"), ["Je regarde le canvas, "]);
+  // From then on, whole sentences: a comma no longer cuts.
+  assert.deepEqual(s.push(" te dis ce que je trouve, promis"), []);
+  assert.deepEqual(s.push(". Voilà."), ["et je te dis ce que je trouve, promis. "]);
+  assert.deepEqual(s.flush(), ["Voilà."]);
+
+  // Too short to be worth a breath, and numbers are not clauses.
+  const short = createSentenceSplitter();
+  assert.deepEqual(short.push("Oui, bien sûr, il y en a 3,5 millions"), []);
+  // A sentence that ends first wins over a later comma.
+  const whole = createSentenceSplitter();
+  assert.deepEqual(whole.push("C'est fait pour ce node. Ensuite, on verra"), ["C'est fait pour ce node. "]);
+});
+
 test("LLM providers and allowed models come from the environment", () => {
   const config = loadConfig({
     MISTRAL_API_KEY: "m",
