@@ -261,6 +261,7 @@ export function startMockMistral(port = 0): Promise<MockMistral> {
     ws.send(JSON.stringify({ type: "session.created", session: session() }));
 
     let appendCount = 0;
+    let finalized = false;
     let diarize = false;
     let turnDetection = false;
     const parts: string[] = [];
@@ -328,9 +329,11 @@ export function startMockMistral(port = 0): Promise<MockMistral> {
           );
           return;
         }
+        // Like Voxtral 3: a flush finalizes the transcription, same as `end`.
         case "input_audio.flush":
-          return;
         case "input_audio.end": {
+          if (finalized) return;
+          finalized = true;
           if (turnDetection) {
             ws.send(JSON.stringify({ type: "turn.end", time_s: appendCount, end_reason: "threshold" }));
           }

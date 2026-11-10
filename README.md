@@ -377,7 +377,9 @@ Client → server:
    `error` (`bad_message`) and close `4400`, before anything is sent upstream.
 2. Binary frames: raw **PCM s16le mono** at the declared rate (~100 ms per
    frame recommended; max 1 MiB per frame).
-3. `{"type":"flush"}` (optional): force early processing of buffered audio.
+3. `{"type":"flush"}` (optional): transcribe what is buffered now. On
+   Voxtral 3 this **finalizes the session** (a `done` event follows and the
+   socket closes), like `stop`.
 4. `{"type":"stop"}`: finalize — remaining deltas and `done` follow, then the
    socket closes normally.
 
@@ -580,7 +582,7 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 |---|---|---|---|
 | `MISTRAL_API_KEY` | yes | — | Mistral API key (server-side only) |
 | `AUTH_TOKEN` | yes | — | shared bearer token for your apps (use `openssl rand -hex 32`) |
-| `ALLOWED_ORIGINS` | yes | — | comma-separated origins; `*` disables the check (dev only) |
+| `ALLOWED_ORIGINS` | yes | — | comma-separated origins of your apps; `*` disables the check (dev only). The server's own demo pages are always allowed |
 | `PORT` | no | `3000` | injected by Railway |
 | `BATCH_MODEL` | no | `voxtral-mini-transcribe-3-0` | bulk transcription model (`voxtral-small-transcribe-3-0` = higher quality) |
 | `REALTIME_MODEL` | no | `voxtral-mini-transcribe-realtime-3-0` | realtime model |
@@ -665,6 +667,10 @@ npm test           # protocol + auth + batch + full WS bridges against the mocks
 npm run typecheck
 npm run build && npm start
 ```
+
+CI (`.github/workflows/ci.yml`) runs the typecheck, the build, the tests
+(with ffmpeg, so the media end-to-end tests run) and a Docker image build on
+every push.
 
 The test suite needs no API keys: `test/mock-mistral.ts` emulates the Mistral
 batch endpoint and realtime WebSocket, `test/mock-gladia.ts` the Gladia

@@ -139,6 +139,24 @@ test("a spoken turn gets a spoken reply", async () => {
   c.ws.close();
 });
 
+test("it keeps listening turn after turn", async () => {
+  llm.script({ text: ["Un."] }, { text: ["Deux."] });
+  const c = await open();
+  await c.next("ready");
+  c.turn("start");
+  c.say("premier tour");
+  c.turn("end");
+  assert.equal((await c.next("response_done")).text, "Un.");
+  c.say(" ?"); // punctuation trailing in after the turn was answered
+  await sleep(350); // the reply has finished playing
+  c.turn("start");
+  c.say("deuxième tour");
+  c.turn("end");
+  assert.equal((await c.next("user_turn", 1)).text, "deuxième tour");
+  assert.equal((await c.next("response_done", 1)).text, "Deux.");
+  c.ws.close();
+});
+
 test("speculation: work starts on eager_end, stays hidden, and is dropped on resume", async () => {
   llm.script({ text: ["Réponse trop tôt."] }, { text: ["Bonne réponse."] });
   const c = await open();

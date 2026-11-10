@@ -1,0 +1,42 @@
+name: CI
+
+# Every push, on any branch: a pull request's checks come from its branch's
+# pushes, so there is no separate pull_request trigger (it would run twice).
+on:
+  push:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Typecheck, build, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # needs >= 22.18 (runs TypeScript natively)
+          cache: npm
+      # The media end-to-end tests skip themselves without ffmpeg; install it
+      # so they actually run.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # The image is what gets deployed: catch a broken Dockerfile here.
+      - run: docker build -t voice-server:ci .

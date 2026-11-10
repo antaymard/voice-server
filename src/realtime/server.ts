@@ -85,7 +85,7 @@ export function attachRealtime(
       rejectUpgrade(socket, 401, token ? "invalid token" : "missing token");
       return;
     }
-    if (!isOriginAllowed(req.headers.origin, config.allowedOrigins)) {
+    if (!isOriginAllowed(req.headers.origin, config.allowedOrigins, req.headers.host)) {
       rejectUpgrade(socket, 403, `origin "${req.headers.origin}" not in ALLOWED_ORIGINS`);
       return;
     }

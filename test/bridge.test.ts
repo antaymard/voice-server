@@ -227,6 +227,12 @@ test("disallowed origin is rejected at upgrade with 403", async () => {
     await allowed.opened;
     allowed.ws.close();
     await allowed.closed;
+
+    // A page served by the server itself (the demos) needs no allowlist entry.
+    const own = connect(restricted.port, { origin: `http://127.0.0.1:${restricted.port}` });
+    await own.opened;
+    own.ws.close();
+    await own.closed;
   } finally {
     await restricted.close();
   }

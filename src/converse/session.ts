@@ -142,6 +142,8 @@ function heardText(segments: Segment[], now: number): string {
   return parts.join(" ");
 }
 
+const HAS_WORDS = /[\p{L}\p{N}]/u;
+
 const wordsOf = (text: string): string[] =>
   text
     .toLowerCase()
@@ -627,6 +629,8 @@ export function runConverseSession(
 
   const onTranscript = (text: string): void => {
     if (!text || deaf()) return;
+    // Punctuation trailing in after its turn was answered: not a new turn.
+    if (!turnOpen && !settleTimer && !userBuffer && !HAS_WORDS.test(text)) return;
     // Words with no turn open yet: same suspicion rule as a turn start.
     if (!turnOpen && !userBuffer && !settleTimer && current?.committed) suspect = true;
     userBuffer += text;
@@ -668,9 +672,9 @@ export function runConverseSession(
         return;
       case "end": {
         turnOpen = false;
-        // Ask for the words still in the transcriber's buffer, then give
-        // them a moment to arrive before answering.
-        upstream?.flush();
+        // The last words can trail the end of the turn: give them a moment
+        // to arrive before answering. (Never `flush` here: on Voxtral 3 a
+        // flush finalizes the transcription and ends the session.)
         settleDeadline = Date.now() + config.converseSettleMs * 4;
         armSettle();
         return;
@@ -710,6 +714,9 @@ export function runConverseSession(
         }),
       onDelta: onTranscript,
       onTurn: ({ phase }) => onTurn(phase),
+      // Nothing here asks for the final transcript, so getting one means the
+      // assistant has gone deaf: say so rather than sit there silently.
+      onDone: () => fail("upstream_error", "The transcription session ended", CLOSE_UPSTREAM_ERROR),
       onError: (code, message) =>
         fail(code, message, code === "server_error" ? CLOSE_INTERNAL : CLOSE_UPSTREAM_ERROR),
     });

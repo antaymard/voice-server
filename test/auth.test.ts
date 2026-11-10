@@ -43,3 +43,12 @@ test("isOriginAllowed lets non-browser clients (no Origin) through", () => {
   assert.equal(isOriginAllowed(undefined, ["https://app.example.com"]), true);
   assert.equal(isOriginAllowed(null, ["https://app.example.com"]), true);
 });
+
+test("isOriginAllowed always lets the server's own pages in", () => {
+  const allowed = ["https://app.example.com"];
+  assert.equal(isOriginAllowed("https://voice.example.com", allowed, "voice.example.com"), true);
+  assert.equal(isOriginAllowed("http://localhost:3000", allowed, "localhost:3000"), true);
+  assert.equal(isOriginAllowed("https://evil.example", allowed, "voice.example.com"), false);
+  assert.equal(isOriginAllowed("https://voice.example.com.evil.example", allowed, "voice.example.com"), false);
+  assert.equal(isOriginAllowed("not a url", allowed, "voice.example.com"), false);
+});
