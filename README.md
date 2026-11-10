@@ -40,7 +40,8 @@ with optional [Gladia](https://docs.gladia.io)-backed alternatives.
   recording (audio or video, up to hours), re-encodes it to light mono mp3/ogg
   and splits it into ~20 min parts cut in silences, so a 25 MB-capped STT
   can transcribe it part by part. Pure media processing (ffmpeg) — no STT.
-- One shared token for all your apps + an origin allowlist; your
+- One server token for your backends, short-lived scoped **session tokens**
+  for browsers (`/v1/tokens`), and an origin allowlist; your
   `MISTRAL_API_KEY`/`GLADIA_API_KEY` never leave the server.
 - Ships a copyable **React kit** (`client/`) — mic capture worklet,
   `useRealtimeTranscription` hook, `transcribeFile`, `synthesizeSpeech` and
@@ -83,6 +84,7 @@ Everything the server exposes, in one place. Each line links to its details.
 | `GET /v1/media/audio-parts/:id` | Job status and the list of parts | same |
 | `GET /v1/media/audio-parts/:id/parts/:index` | Download one part (audio bytes) | same |
 | `DELETE /v1/media/audio-parts/:id` | Cancel a job and delete its files | same |
+| [`POST /v1/tokens`](#post-v1tokens--session-tokens-for-browsers) | Mint a short-lived, scoped token for a browser (server token only) | — |
 | [`GET /healthz`](#get-healthz) | Liveness and counters; no auth | — |
 | `GET /`, `/converse.html` | Demo pages (transcription, live conversation); static and public | — |
 
@@ -97,9 +99,11 @@ frames of mic audio (PCM s16le mono); the server answers with JSON events.
 
 **Rules that apply everywhere**
 
-- **Auth**: one shared token. HTTP sends `Authorization: Bearer <AUTH_TOKEN>`;
-  WebSockets pass it as `?token=<AUTH_TOKEN>` (browsers can't set headers on
-  a WebSocket).
+- **Auth**: HTTP sends `Authorization: Bearer <token>`; WebSockets pass it as
+  `?token=<token>` (browsers can't set headers on a WebSocket). The token is
+  either the server's `AUTH_TOKEN` — for your backends only: it never expires
+  and opens everything — or a [session token](#post-v1tokens--session-tokens-for-browsers)
+  your backend mints for a browser: one hour, limited to the features you name.
 - **Origins**: a browser request must come from an origin listed in
   `ALLOWED_ORIGINS` (the server's own pages always pass). Requests without
   an `Origin` header (servers, curl, native apps) rely on the token alone.
@@ -158,6 +162,36 @@ entries share the model's context window with the audio: keep the list short
 on long recordings (too long → `400` from Mistral). Uploads above
 `MAX_UPLOAD_BYTES` get `413`; upstream auth problems surface as `502
 upstream_auth` (it's the server's key, not yours).
+
+### `POST /v1/tokens` — session tokens for browsers
+
+A browser needs a token to open a WebSocket here, and whatever reaches a
+browser can be copied out of it. So don't hand it `AUTH_TOKEN`: have your
+backend mint a session token for the signed-in user and pass that along.
+Only `AUTH_TOKEN` can call this endpoint.
+
+| Field | Required | Notes |
+|---|---|---|
+| `scopes` | yes | what the token may use: `stt` (`/v1/transcribe`, `/v1/realtime`, `/v1/gladia/*`), `tts` (`/v1/speak`, `/v1/voices`), `converse`, `decide`, `media` |
+| `subject` | no | who it is for (your user id); written to the server log when a WebSocket opens |
+| `ttl_seconds` | no | lifetime, default and maximum `SESSION_TOKEN_MAX_TTL_SEC` (one hour) |
+
+```bash
+curl -X POST https://your-server/v1/tokens \
+  -H "Authorization: Bearer $AUTH_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "scopes": ["stt"], "subject": "user_42" }'
+# -> { "token": "vs_s_eyJzdWIi…", "expires_at": "2026-11-10T14:00:00.000Z",
+#      "scopes": ["stt"], "subject": "user_42" }
+```
+
+The browser uses `token` exactly where `AUTH_TOKEN` went. Outside its scopes
+it gets `403 forbidden`; once expired, `401 token_expired` (a WebSocket
+upgrade is refused with `401`): ask your backend for a new one. Expiry is
+checked when a connection opens, so a session in progress is not cut.
+
+Tokens are signed with a key derived from `AUTH_TOKEN`, not stored: they
+survive restarts, a single one cannot be revoked before it expires, and
+rotating `AUTH_TOKEN` invalidates them all.
 
 ### `POST /v1/decide` — fast typed decisions
 
@@ -689,6 +723,7 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `MISTRAL_API_KEY` | yes | — | Mistral API key (server-side only) |
 | `AUTH_TOKEN` | yes | — | shared bearer token for your apps (use `openssl rand -hex 32`) |
 | `ALLOWED_ORIGINS` | yes | — | comma-separated origins of your apps; `*` disables the check (dev only). The server's own demo pages are always allowed |
+| `SESSION_TOKEN_MAX_TTL_SEC` | no | `3600` | longest lifetime `/v1/tokens` grants a session token |
 | `PORT` | no | `3000` | injected by Railway |
 | `BATCH_MODEL` | no | `voxtral-mini-transcribe-3-0` | bulk transcription model (`voxtral-small-transcribe-3-0` = higher quality) |
 | `REALTIME_MODEL` | no | `voxtral-mini-transcribe-realtime-3-0` | realtime model |
