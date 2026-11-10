@@ -102,6 +102,15 @@ export type ConverseStartMessage = {
    * `false` falls back to simple rules.
    */
   decide?: boolean;
+  /**
+   * Who answers the user.
+   * - `"server"` (default): the server's LLM, with your `instructions` and `tools`.
+   * - `"client"`: your own agent. The server is then ears and mouth only: it
+   *   listens, tells you each finished turn (`user_turn`), and speaks the text
+   *   you send with `say`. No LLM runs here; `instructions`, `tools`, `text`
+   *   and `event` do nothing.
+   */
+  brain?: "server" | "client";
   /** How long a response waits for a `tool_result` before moving on. */
   toolTimeoutMs?: number;
 };
@@ -136,6 +145,19 @@ export type TextMessage = { type: "text"; text: string };
  */
 export type EventMessage = { type: "event"; text: string; speak?: "when_idle" | "now" | "never" };
 
+/**
+ * Speak this text as it is (no LLM involved). Send an answer as it is being
+ * written: several `say` with the same `id` carry its successive pieces, the
+ * last one with `done: true`. A new `id` starts a new spoken reply, cutting
+ * the previous one if it is still playing.
+ *
+ * If the user talks over a reply, it is cut (`interrupt` event, with its
+ * `sayId`), and whatever else arrives under that `id` is dropped: keep
+ * streaming, the server sorts it out. Text for a reply that would start
+ * while the user is speaking is dropped too.
+ */
+export type SayMessage = { type: "say"; id: string; text: string; done?: boolean };
+
 /** Stop the assistant's current response (e.g. a "stop" button). */
 export type InterruptMessage = { type: "interrupt" };
 
@@ -147,6 +169,7 @@ export type ConverseClientMessage =
   | ToolResultMessage
   | TextMessage
   | EventMessage
+  | SayMessage
   | InterruptMessage
   | ConverseStopMessage;
 
@@ -159,6 +182,8 @@ export type ConverseReadyEvent = {
   llmModel: string;
   /** Decision model in use for this conversation, or null. */
   deciderModel: string | null;
+  /** Who answers the user (cf. `start.brain`). */
+  brain: "server" | "client";
   /** Format of the binary frames the server sends. */
   audio: { encoding: "pcm_s16le"; sampleRate: number; channels: 1 };
 };
@@ -171,7 +196,12 @@ export type ConverseTurnEvent = { type: "turn"; phase: TurnPhase };
 /** The user's finished turn, as given to the model. */
 export type UserTurnEvent = { type: "user_turn"; text: string };
 
-export type ResponseStartEvent = { type: "response_start"; responseId: string };
+export type ResponseStartEvent = {
+  type: "response_start";
+  responseId: string;
+  /** The `id` of the `say` being spoken, when the reply is yours. */
+  sayId?: string;
+};
 
 /** Text of the assistant's reply, as it is generated (ahead of the audio). */
 export type AssistantDeltaEvent = { type: "assistant_delta"; responseId: string; text: string };
@@ -198,6 +228,8 @@ export type ResponseDoneEvent = {
   type: "response_done";
   responseId: string;
   text: string;
+  /** The `id` of the `say` that was spoken, when the reply is yours. */
+  sayId?: string;
   /**
    * How the reply was spoken, when it was: `realtime` (text streamed into the
    * speech model as it was written) or `http` (one request per sentence — the
@@ -212,7 +244,13 @@ export type ResponseDoneEvent = {
  * playback and drop queued audio. `heardText` is the server's estimate of
  * what was played, which is what the model remembers having said.
  */
-export type InterruptEvent = { type: "interrupt"; responseId: string; heardText: string };
+export type InterruptEvent = {
+  type: "interrupt";
+  responseId: string;
+  heardText: string;
+  /** The `id` of the `say` that was cut, when the reply is yours. */
+  sayId?: string;
+};
 
 /** A response failed; the session goes on. */
 export type ResponseErrorEvent = {
@@ -264,6 +302,7 @@ export type ConverseStartParams = {
   speculate: boolean;
   actEarly: boolean;
   decide: boolean;
+  brain: "server" | "client";
   toolTimeoutMs: number;
 };
 
@@ -299,6 +338,12 @@ export function parseConverseClientMessage(raw: string): ConverseClientMessage |
       if (typeof msg["text"] !== "string") return null;
       if (speak !== undefined && speak !== "when_idle" && speak !== "now" && speak !== "never") return null;
       return { type: "event", text: msg["text"], ...(speak ? { speak } : {}) };
+    }
+    case "say": {
+      const { id, text, done } = msg;
+      if (typeof id !== "string" || !id || id.length > 200 || typeof text !== "string") return null;
+      if (!optionalBoolean(done)) return null;
+      return { type: "say", id, text, ...(done ? { done: true } : {}) };
     }
     case "interrupt":
       return { type: "interrupt" };
@@ -412,6 +457,10 @@ export function normalizeConverseStart(
   const history = normalizeHistory(raw["history"]);
   if ("error" in history) return history;
 
+  if (raw["brain"] !== undefined && raw["brain"] !== "server" && raw["brain"] !== "client") {
+    return { error: '`brain` must be "server" or "client"' };
+  }
+
   const toolTimeoutMs = msg.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
   if (!Number.isInteger(toolTimeoutMs) || toolTimeoutMs <= 0 || toolTimeoutMs > MAX_TOOL_TIMEOUT_MS) {
     return { error: `\`toolTimeoutMs\` must be an integer between 1 and ${MAX_TOOL_TIMEOUT_MS}` };
@@ -433,6 +482,7 @@ export function normalizeConverseStart(
     speculate: msg.speculate !== false,
     actEarly: msg.actEarly !== false,
     decide: msg.decide !== false,
+    brain: msg.brain === "client" ? "client" : "server",
     toolTimeoutMs,
   };
 }

@@ -567,6 +567,8 @@ What the server does for you:
   realtime speech WebSocket word by word, so audio can start before the first
   sentence is finished. If that connection fails, the server falls back to
   one speech request per sentence.
+- **Or lends its voice to your own agent.** With `brain: "client"` the
+  server only listens and speaks; your app's agent does the thinking.
 - **Hears from your app.** An `event` message brings in what happens outside
   the conversation (a long-running agent finishing, a question to relay);
   the assistant speaks up about it when the moment is right.
@@ -590,13 +592,27 @@ What the server does for you:
    | `bargeIn` | `true` | let the user interrupt by speaking. `false` ignores the mic entirely while the assistant speaks |
    | `speculate` | `true` | prepare the reply on `eager_end` |
    | `decide` | `true` | use the server's decision model for the judgment calls above (`false`: rules of thumb) |
+   | `brain` | `"server"` | `"client"`: no LLM here; you answer `user_turn` yourself and the server speaks your `say` text (see "Your own brain") |
    | `toolTimeoutMs` | `15000` | how long a response waits for a `tool_result` |
 
 2. Binary frames of mic audio (PCM s16le mono, as `/v1/realtime`).
 3. Optional text frames: `{ "type": "tool_result", "callId", "output", "isError?" }`,
    `{ "type": "text", "text" }` (a typed user message),
    `{ "type": "event", "text", "speak?" }` (something happened in your app, see below),
+   `{ "type": "say", "id", "text", "done?" }` (speak this text as it is, see below),
    `{ "type": "interrupt" }` (a "stop talking" button), `{ "type": "stop" }`.
+
+**Your own brain.** With `"brain": "client"` in `start`, no LLM runs on the
+server: it is ears and mouth for an agent that lives in your app. Each
+finished turn arrives as `user_turn`; you answer by sending the reply's text
+as it is written — `{ "type": "say", "id", "text" }`, several times with the
+same `id`, the last one with `"done": true`. The server speaks it sentence by
+sentence, and still handles turn-taking, barge-in and echo. If the user talks
+over a reply, you get `interrupt` with its `sayId`, and anything else sent
+under that `id` is dropped (keep streaming, the server sorts it out); a reply
+does not start while the user is speaking either. `response_start`,
+`response_done` and `interrupt` carry the `sayId` they are about.
+`instructions`, `tools`, `text` and `event` do nothing in this mode.
 
 **App events.** `event` tells the assistant something the user did not say:
 a background job progressed or finished, another agent has a question, the

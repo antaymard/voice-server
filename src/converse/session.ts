@@ -22,6 +22,9 @@
  *   writing: is this an interruption, an acknowledgement or an echo; was the
  *   sentence left hanging; is there already something to act on. Each has a
  *   rule of thumb to fall back on if the model is absent, slow or failing.
+ * - Bring your own brain: with `brain: "client"` no LLM runs here. The
+ *   session only listens (turns, barge-in, echo) and speaks the text the
+ *   client sends with `say`, so an agent that lives elsewhere gets a voice.
  * - Tools don't block the conversation: a call that outlives its response
  *   (timeout or interruption) keeps running client-side, and its result is
  *   picked up when it arrives.
@@ -219,6 +222,8 @@ type ResponseState = {
   playhead: number;
   onCommit: Array<() => void>;
   clearTimer: NodeJS.Timeout | null;
+  /** Set when the reply is the client's own text (cf. the `say` message). */
+  sayId?: string;
 };
 
 type ToolWaiter = {
@@ -714,7 +719,17 @@ export function runConverseSession(
         if (index >= 0) history.splice(index, 1);
       }
     }
-    send({ type: "interrupt", responseId: response.id, heardText: heard });
+    if (response.sayId !== undefined) {
+      // The rest of this reply, still on its way from the client, is dropped.
+      muteSay(response.sayId);
+      if (speaking?.response === response) speaking = null;
+    }
+    send({
+      type: "interrupt",
+      responseId: response.id,
+      heardText: heard,
+      ...(response.sayId !== undefined ? { sayId: response.sayId } : {}),
+    });
     if (current === response) current = null;
   };
 
@@ -724,6 +739,26 @@ export function runConverseSession(
     else discardSpeculative(current);
   };
 
+  const newResponse = (userText: string | null, committed: boolean): ResponseState => ({
+    id: randomUUID(),
+    abort: new AbortController(),
+    committed,
+    userText,
+    outbox: [],
+    buffered: [],
+    phase: "llm",
+    roundText: "",
+    text: "",
+    segments: [],
+    finalMessage: null,
+    ttsChain: Promise.resolve(),
+    ttsFailed: false,
+    speechVia: null,
+    playhead: 0,
+    onCommit: [],
+    clearTimer: null,
+  });
+
   const startResponse = (userText: string | null, committed: boolean): void => {
     stopCurrent();
     // From here the reply handles the request: no second opinion in parallel.
@@ -731,25 +766,7 @@ export function runConverseSession(
     earlyPass = null;
     earlyLookAtLlm = false;
     speculateAfterLook = false;
-    const response: ResponseState = {
-      id: randomUUID(),
-      abort: new AbortController(),
-      committed,
-      userText,
-      outbox: [],
-      buffered: [],
-      phase: "llm",
-      roundText: "",
-      text: "",
-      segments: [],
-      finalMessage: null,
-      ttsChain: Promise.resolve(),
-      ttsFailed: false,
-      speechVia: null,
-      playhead: 0,
-      onCommit: [],
-      clearTimer: null,
-    };
+    const response = newResponse(userText, committed);
     current = response;
     if (committed) {
       openTurn(userText);
@@ -985,8 +1002,61 @@ export function runConverseSession(
     segmentStart = 0;
     completeness = null;
     send({ type: "user_turn", text });
+    // With the client's own brain, the turn is theirs to answer (cf. `say`).
+    if (params?.brain === "client") return;
     if (current && !current.committed && current.userText === text) commit(current);
     else startResponse(text, true);
+  };
+
+  // --- Speaking the client's own text (cf. the `say` message) ---------------
+
+  /** The reply being received from the client, if any. */
+  let speaking: { id: string; response: ResponseState; stream: TtsStream } | null = null;
+  /** Replies that were cut or refused: what still arrives for them is dropped. */
+  const mutedSays: string[] = [];
+  const muteSay = (id: string): void => {
+    mutedSays.push(id);
+    if (mutedSays.length > 50) mutedSays.shift();
+  };
+
+  const onSay = (id: string, text: string, done: boolean): void => {
+    if (mutedSays.includes(id)) return;
+    if (speaking?.id !== id) {
+      // The user has the floor: a reply does not start over them.
+      if (turnOpen && !suspect) {
+        muteSay(id);
+        return;
+      }
+      stopCurrent();
+      const response = newResponse(null, true);
+      response.sayId = id;
+      response.phase = "done"; // nothing of it goes to this server's history
+      current = response;
+      audible = response;
+      const stream = deps.tts({ voice: params?.voice, signal: response.abort.signal });
+      pumpSpeech(response, stream, response.segments);
+      speaking = { id, response, stream };
+      send({ type: "response_start", responseId: response.id, sayId: id });
+    }
+    const { response, stream } = speaking;
+    if (text) {
+      response.text += text;
+      stream.write(text);
+    }
+    if (!done) return;
+    speaking = null;
+    stream.end();
+    void response.ttsChain.then(() => {
+      if (response.abort.signal.aborted) return;
+      send({
+        type: "response_done",
+        responseId: response.id,
+        text: response.text,
+        sayId: id,
+        ...(response.speechVia ? { speech: response.speechVia } : {}),
+      });
+      scheduleClear(response);
+    });
   };
 
   const commitTurn = (): void => {
@@ -1083,7 +1153,13 @@ export function runConverseSession(
           // the reply now would cancel that and redo it after the turn ends; let
           // it finish first (it takes about as long as the pause itself).
           speculateAfterLook = true;
-        } else if (!suspect && params?.speculate && !current && userBuffer.trim()) {
+        } else if (
+          params?.brain !== "client" &&
+          !suspect &&
+          params?.speculate &&
+          !current &&
+          userBuffer.trim()
+        ) {
           startResponse(userBuffer.trim(), false);
         }
         return;
@@ -1140,6 +1216,7 @@ export function runConverseSession(
           llmProvider: llmName,
           llmModel,
           deciderModel: deciding() ? config.deciderModel : null,
+          brain: start.brain,
           audio: { encoding: "pcm_s16le", sampleRate: TTS_SAMPLE_RATE, channels: 1 },
         }),
       onDelta: onTranscript,
@@ -1202,7 +1279,11 @@ export function runConverseSession(
       case "tool_result":
         onToolResult(message.callId, message.output, message.isError === true);
         return;
+      case "say":
+        onSay(message.id, message.text.slice(0, MAX_TEXT_CHARS), message.done === true);
+        return;
       case "text": {
+        if (params.brain === "client") return; // no LLM here to answer it
         const text = message.text.trim().slice(0, MAX_TEXT_CHARS);
         if (!text) return;
         dropTurn(); // typing overrides whatever the mic was picking up
@@ -1211,6 +1292,7 @@ export function runConverseSession(
         return;
       }
       case "event": {
+        if (params.brain === "client") return; // no LLM here to tell it to
         const text = message.text.trim().slice(0, MAX_TEXT_CHARS);
         if (!text) return;
         const silent = message.speak === "never";
