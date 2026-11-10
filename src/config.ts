@@ -40,6 +40,14 @@ export type Config = {
   llmModel: string;
   /** What a client may pick per conversation besides the default; "*" = anything. */
   llmAllowedModels: "*" | { provider: string; model: string }[];
+  /**
+   * How /v1/converse speaks: "realtime" streams the reply's text into
+   * Mistral's speech WebSocket as it is written (falls back to "http" when
+   * that fails); "http" makes one speech request per sentence.
+   */
+  converseTts: "realtime" | "http";
+  /** Sample encoding of Mistral's raw `pcm` speech output ("auto" detects it). */
+  ttsPcmEncoding: "auto" | "s16le" | "f32le";
   /** After a turn ends, wait this long for late transcript text before answering. */
   converseSettleMs: number;
   /** Gladia API key; "" disables the /v1/gladia/* endpoints. */
@@ -211,6 +219,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 
   const llmProviders = loadLlmProviders(env);
 
+  const converseTts = env["CONVERSE_TTS"] || "realtime";
+  if (converseTts !== "realtime" && converseTts !== "http") {
+    throw new Error(`Invalid CONVERSE_TTS "${converseTts}": use "realtime" or "http"`);
+  }
+  const ttsPcmEncoding = env["TTS_PCM_ENCODING"] || "auto";
+  if (ttsPcmEncoding !== "auto" && ttsPcmEncoding !== "s16le" && ttsPcmEncoding !== "f32le") {
+    throw new Error(`Invalid TTS_PCM_ENCODING "${ttsPcmEncoding}": use "auto", "s16le" or "f32le"`);
+  }
+
   return {
     port: intEnv(env, "PORT", 3000),
     mistralApiKey: env["MISTRAL_API_KEY"] as string,
@@ -232,6 +249,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     llmProviders,
     llmModel: env["LLM_MODEL"] || "mistral-small-latest",
     llmAllowedModels: parseAllowedModels(env["LLM_MODELS"], llmProviders),
+    converseTts,
+    ttsPcmEncoding,
     converseSettleMs: intEnv(env, "CONVERSE_SETTLE_MS", 150),
     gladiaApiKey: env["GLADIA_API_KEY"] || "",
     gladiaBaseUrl: (env["GLADIA_BASE_URL"] || "https://api.gladia.io").replace(/\/$/, ""),

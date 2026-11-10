@@ -26,6 +26,8 @@ export function makeConfig(overrides: Partial<Config> = {}): Config {
     llmProviders: { default: { baseUrl: "http://127.0.0.1:1/v1", apiKey: "mock-llm-key" } },
     llmModel: "mock-llm",
     llmAllowedModels: [],
+    converseTts: "realtime",
+    ttsPcmEncoding: "auto",
     converseSettleMs: 20,
     gladiaApiKey: "mock-gladia-key",
     gladiaBaseUrl: "http://127.0.0.1:1",

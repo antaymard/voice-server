@@ -10,6 +10,9 @@
  *   final, except calls to tools declared `speculative`.
  * - Barge-in: when the user speaks over the assistant, generation and speech
  *   stop, and the conversation history keeps only what was actually heard.
+ *   A turn that starts while the assistant is audible only counts once it
+ *   carries words that are not the assistant's own (echo from the speakers,
+ *   a cough or a door slam don't cut it off).
  * - Tools don't block the conversation: a call that outlives its response
  *   (timeout or interruption) keeps running client-side, and its result is
  *   picked up when it arrives.
@@ -39,8 +42,7 @@ import {
 import type { Config } from "../config.ts";
 import { sendRawSessionUpdate } from "../mistral.ts";
 import { resolveLlm, type ChatMessage, type Llm, type ToolCall } from "./llm.ts";
-import { createSentenceSplitter, toSpeakable } from "./sentences.ts";
-import { TTS_BYTES_PER_SECOND, TTS_SAMPLE_RATE, type Tts } from "./tts.ts";
+import { TTS_BYTES_PER_SECOND, TTS_SAMPLE_RATE, type Tts, type TtsStream } from "./tts.ts";
 
 export type ConverseDeps = { realtime: RealtimeTranscription; llm: Llm; tts: Tts };
 
@@ -55,6 +57,10 @@ const HISTORY_HIGH_WATER = 120;
 const HISTORY_LOW_WATER = 80;
 /** Used to guess the length of a sentence whose audio is still being generated. */
 const EST_BYTES_PER_CHAR = TTS_BYTES_PER_SECOND / 15;
+/** The client plays slightly behind our clock (network, its jitter buffer). */
+const PLAYBACK_MARGIN_MS = 250;
+/** Share of the user's word pairs found in the assistant's speech that marks an echo. */
+const ECHO_MATCH_RATIO = 0.6;
 
 const VOICE_PREAMBLE =
   "You are a voice assistant in a live spoken conversation. Everything you write is read aloud: " +
@@ -152,6 +158,32 @@ function heardText(segments: Segment[], now: number): string {
   return parts.join(" ");
 }
 
+const wordsOf = (text: string): string[] =>
+  text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .match(/[\p{L}\p{N}]+/gu) ?? [];
+
+/**
+ * Is what the mic picked up the assistant's own voice coming back? Echo
+ * repeats the assistant's words in order, so it shows up as shared word
+ * pairs; a person talking over it says something else. "unknown" = no words.
+ */
+export function classifyEcho(heard: string, assistantSaid: string): "echo" | "speech" | "unknown" {
+  const heardWords = wordsOf(heard);
+  if (heardWords.length === 0) return "unknown";
+  const said = wordsOf(assistantSaid);
+  if (heardWords.length === 1) return said.includes(heardWords[0] as string) ? "echo" : "speech";
+  const pairs = new Set<string>();
+  for (let i = 0; i + 1 < said.length; i += 1) pairs.add(`${said[i]} ${said[i + 1]}`);
+  let matches = 0;
+  for (let i = 0; i + 1 < heardWords.length; i += 1) {
+    if (pairs.has(`${heardWords[i]} ${heardWords[i + 1]}`)) matches += 1;
+  }
+  return matches / (heardWords.length - 1) >= ECHO_MATCH_RATIO ? "echo" : "speech";
+}
+
 /** Providers reject two user messages in a row: merge them. */
 function mergeUserMessages(messages: ChatMessage[]): ChatMessage[] {
   const out: ChatMessage[] = [];
@@ -193,6 +225,12 @@ export function runConverseSession(
   let settleTimer: NodeJS.Timeout | null = null;
   let settleDeadline = 0;
   let current: ResponseState | null = null;
+  /**
+   * The open user turn began while the assistant was audible: it is held
+   * back (not shown, not acted on) until it proves to be the user speaking.
+   */
+  let suspect = false;
+  let heldEvents: ConverseServerEvent[] = [];
   const waiters = new Map<string, ToolWaiter>();
   /** Calls whose response moved on; value = tool name. */
   const lateCalls = new Map<string, string>();
@@ -300,34 +338,27 @@ export function runConverseSession(
     response.clearTimer = setTimeout(
       () => {
         if (current === response) current = null;
+        if (suspect && !turnOpen && !settleTimer) dropTurn();
         followUpIfIdle();
       },
-      Math.max(0, response.playhead - Date.now()),
+      Math.max(0, response.playhead - Date.now()) + PLAYBACK_MARGIN_MS,
     );
   };
 
-  const speak = (response: ResponseState, text: string): void => {
-    const segment: Segment = { text, bytes: 0, complete: false, chunks: [] };
-    response.segments.push(segment);
-    const speakable = toSpeakable(text);
+  /** Relay one utterance's audio, after the previous utterances of the response. */
+  const pumpSpeech = (response: ResponseState, stream: TtsStream, segments: Segment[]): void => {
     response.ttsChain = response.ttsChain.then(async () => {
       const { signal } = response.abort;
-      if (signal.aborted || !speakable) {
-        segment.complete = true;
-        return;
-      }
-      // PCM samples are 2 bytes: never split one across frames.
-      let carry: Buffer | null = null;
       try {
-        for await (const chunk of deps.tts(speakable, { voice: params?.voice, signal })) {
+        for await (const item of stream.items) {
           if (signal.aborted) return;
-          const data: Buffer = carry ? Buffer.concat([carry, chunk]) : chunk;
-          const even = data.length - (data.length % 2);
-          carry = even < data.length ? data.subarray(even) : null;
-          if (even === 0) continue;
-          const audio = data.subarray(0, even);
-          segment.bytes += audio.length;
-          emit(response, { audio, segment });
+          const segment = (segments[item.segment] ??= { text: "", bytes: 0, complete: false, chunks: [] });
+          segment.text = item.text;
+          if (item.audio) {
+            segment.bytes += item.audio.length;
+            emit(response, { audio: item.audio, segment });
+          }
+          if (item.done) segment.complete = true;
         }
       } catch (err) {
         if (signal.aborted) return;
@@ -339,7 +370,6 @@ export function runConverseSession(
           });
         }
       }
-      segment.complete = true;
     });
   };
 
@@ -394,12 +424,16 @@ export function runConverseSession(
     const { signal } = response.abort;
     const active = llm;
     if (!active || !params) return;
+    let speech: TtsStream | null = null;
     try {
       for (let round = 0; round < MAX_ROUNDS; round += 1) {
         response.phase = "llm";
         response.roundText = "";
         response.segments = [];
-        const splitter = createSentenceSplitter();
+        // Opened before the first word exists, so the voice is ready when it does.
+        const voice = deps.tts({ voice: params.voice, signal });
+        speech = voice;
+        pumpSpeech(response, voice, response.segments);
         const calls: ToolCall[] = [];
         const stream = deps.llm({
           provider: active.provider,
@@ -417,10 +451,11 @@ export function runConverseSession(
           response.roundText += chunk.text;
           response.text += chunk.text;
           emit(response, { event: { type: "assistant_delta", responseId: response.id, text: chunk.text } });
-          for (const sentence of splitter.push(chunk.text)) speak(response, sentence);
+          voice.write(chunk.text);
         }
         if (signal.aborted) return;
-        for (const sentence of splitter.flush()) speak(response, sentence);
+        voice.end();
+        speech = null;
 
         const message: AssistantMessage = {
           role: "assistant",
@@ -442,6 +477,7 @@ export function runConverseSession(
     } catch (err) {
       if (signal.aborted) return;
       console.error("[converse] LLM turn failed:", err);
+      speech?.end(); // say what was written before the failure, then stop
       if (response.phase === "llm" && response.roundText) {
         record(response, { role: "assistant", content: response.roundText });
       }
@@ -528,7 +564,10 @@ export function runConverseSession(
       clearTimer: null,
     };
     current = response;
-    if (committed) openTurn(userText);
+    if (committed) {
+      openTurn(userText);
+      audible = response;
+    }
     emit(response, { event: { type: "response_start", responseId: response.id } });
     void runResponse(response);
   };
@@ -537,6 +576,7 @@ export function runConverseSession(
   const commit = (response: ResponseState): void => {
     response.committed = true;
     openTurn(response.userText);
+    audible = response;
     history.push(...response.buffered);
     for (const item of response.outbox) {
       if ("event" in item) send(item.event);
@@ -557,11 +597,39 @@ export function runConverseSession(
 
   // --- User side ------------------------------------------------------------
 
-  /** Echo guard: without barge-in, what the mic hears while we speak is us. */
+  /** Without barge-in, whatever the mic hears while we speak is ignored. */
   const deaf = (): boolean => params?.bargeIn === false && current?.committed === true;
+
+  /** Text the assistant is (or was just) saying out loud. */
+  let audible: ResponseState | null = null;
+
+  /** To the client, unless the turn is still under suspicion. */
+  const tell = (event: ConverseServerEvent): void => {
+    if (suspect) heldEvents.push(event);
+    else send(event);
+  };
+
+  /** The held turn is the user after all: show it and let it interrupt. */
+  const confirmTurn = (): void => {
+    suspect = false;
+    for (const event of heldEvents.splice(0)) send(event);
+    if (current?.committed) interrupt(current);
+  };
+
+  /** The held turn was echo or noise: forget it. */
+  const dropTurn = (): void => {
+    suspect = false;
+    heldEvents = [];
+    userBuffer = "";
+  };
+
+  const reviewSuspect = (): void => {
+    if (suspect && classifyEcho(userBuffer, audible?.text ?? "") === "speech") confirmTurn();
+  };
 
   const commitTurn = (): void => {
     settleTimer = null;
+    if (suspect) dropTurn(); // never turned into speech
     const text = userBuffer.trim();
     userBuffer = "";
     if (!text) {
@@ -582,9 +650,13 @@ export function runConverseSession(
 
   const onTranscript = (text: string): void => {
     if (!text || deaf()) return;
+    // Words with no turn open yet: same suspicion rule as a turn start.
+    if (!turnOpen && !userBuffer && !settleTimer && current?.committed) suspect = true;
     userBuffer += text;
-    send({ type: "transcript", text });
+    tell({ type: "transcript", text });
     if (settleTimer) armSettle();
+    reviewSuspect();
+    if (suspect) return;
     // More words arrived after we started guessing: guess again.
     if (current && !current.committed && current.userText !== userBuffer.trim()) {
       discardSpeculative(current);
@@ -594,7 +666,11 @@ export function runConverseSession(
 
   const onTurn = (phase: TurnPhase): void => {
     if (deaf()) return;
-    send({ type: "turn", phase });
+    if (phase === "start" && !settleTimer) {
+      if (current?.committed) suspect = true;
+      else if (suspect) dropTurn(); // leftovers of an echo that never ended
+    }
+    tell({ type: "turn", phase });
     switch (phase) {
       case "start":
         turnOpen = true;
@@ -603,10 +679,12 @@ export function runConverseSession(
           clearTimeout(settleTimer);
           settleTimer = null;
         }
-        stopCurrent();
+        if (!suspect) stopCurrent();
         return;
       case "eager_end":
-        if (params?.speculate && !current && userBuffer.trim()) startResponse(userBuffer.trim(), false);
+        if (!suspect && params?.speculate && !current && userBuffer.trim()) {
+          startResponse(userBuffer.trim(), false);
+        }
         return;
       case "resume":
         if (current && !current.committed) discardSpeculative(current);
@@ -802,6 +880,7 @@ export function runConverseSession(
       case "text": {
         const text = message.text.trim().slice(0, MAX_TEXT_CHARS);
         if (!text) return;
+        dropTurn(); // typing overrides whatever the mic was picking up
         send({ type: "user_turn", text });
         startResponse(text, true);
         return;

@@ -18,6 +18,11 @@
  *   (speaker_1, null timestamps) instead of a delta; with `turn_detection`,
  *   `turn.start` precedes the first delta and `turn.end` precedes `done`;
  *   both together, or a `session.update` after audio, yield an `error` event.
+ * - realtime speech (WS /v1/audio/speech/realtime): replies `session.created`,
+ *   echoes `session.updated`; every `input_text.flush` (and `input_text.end`
+ *   with text pending) is one generation: the SPEECH_FIXTURE_BYTES deltas then
+ *   `speech.audio.done`. After `end` it closes with 1000. Set
+ *   `failSpeechRealtime` to make connections die at once.
  * - voices: GET /v2/audio/voices returns VOICES_FIXTURE.
  * - Every request the server makes is recorded on `received` for assertions.
  *
@@ -42,7 +47,11 @@ export type MockMistral = {
     realtimeSession: Record<string, unknown> | null;
     /** Query string of the last voices listing. */
     voicesQuery: string | null;
+    /** Last realtime speech connection: its session settings and the text of each generation. */
+    speechRealtime: { session: Record<string, unknown> | null; generations: string[] } | null;
   };
+  /** Realtime speech connections are dropped as soon as they open. */
+  failSpeechRealtime: boolean;
   close: () => Promise<void>;
 };
 
@@ -110,7 +119,9 @@ export function startMockMistral(port = 0): Promise<MockMistral> {
     speech: null,
     realtimeSession: null,
     voicesQuery: null,
+    speechRealtime: null,
   };
+  const flags = { failSpeechRealtime: false };
   const httpServer = createServer((req, res) => {
     if (req.method === "POST" && req.url === "/v1/audio/transcriptions") {
       const auth = req.headers.authorization ?? "";
@@ -184,7 +195,58 @@ export function startMockMistral(port = 0): Promise<MockMistral> {
     res.end(JSON.stringify({ message: "Not found (mock)" }));
   });
 
-  const wss = new WebSocketServer({ server: httpServer, path: "/v1/audio/transcriptions/realtime" });
+  // Two WebSocket endpoints share the HTTP server: route upgrades by path.
+  const wss = new WebSocketServer({ noServer: true });
+  const speechWss = new WebSocketServer({ noServer: true });
+  httpServer.on("upgrade", (req, socket, head) => {
+    const { pathname } = new URL(req.url ?? "", "http://localhost");
+    const target =
+      pathname === "/v1/audio/transcriptions/realtime"
+        ? wss
+        : pathname === "/v1/audio/speech/realtime"
+          ? speechWss
+          : null;
+    if (!target) {
+      socket.destroy();
+      return;
+    }
+    target.handleUpgrade(req, socket, head, (ws) => target.emit("connection", ws, req));
+  });
+
+  speechWss.on("connection", (ws) => {
+    if (flags.failSpeechRealtime) {
+      ws.terminate();
+      return;
+    }
+    const record: NonNullable<MockMistral["received"]["speechRealtime"]> = { session: null, generations: [] };
+    received.speechRealtime = record;
+    ws.send(JSON.stringify({ type: "session.created", session: { model: "mock-tts", voice: "voice_447" } }));
+    let text = "";
+    const generate = (): void => {
+      record.generations.push(text);
+      text = "";
+      for (const chunk of SPEECH_CHUNKS) {
+        ws.send(JSON.stringify({ type: "speech.audio.delta", audio_data: Buffer.from(chunk).toString("base64") }));
+      }
+      ws.send(JSON.stringify({ type: "speech.audio.done", usage: {} }));
+    };
+    ws.on("message", (data) => {
+      const msg = JSON.parse(data.toString()) as { type?: string; text?: string; session?: Record<string, unknown> };
+      if (msg.type === "session.update") {
+        record.session = msg.session ?? null;
+        ws.send(JSON.stringify({ type: "session.updated", session: msg.session }));
+      } else if (msg.type === "input_text.append") {
+        text += msg.text ?? "";
+      } else if (msg.type === "input_text.flush") {
+        text += msg.text ?? "";
+        generate();
+      } else if (msg.type === "input_text.end") {
+        if (text) generate();
+        ws.close(1000);
+      }
+    });
+  });
+
   wss.on("connection", (ws, req) => {
     const model =
       new URL(req.url ?? "", "http://localhost").searchParams.get("model") ?? "mock-model";
@@ -305,10 +367,17 @@ export function startMockMistral(port = 0): Promise<MockMistral> {
         httpUrl: `http://127.0.0.1:${actualPort}`,
         wsUrl: `ws://127.0.0.1:${actualPort}`,
         received,
+        get failSpeechRealtime() {
+          return flags.failSpeechRealtime;
+        },
+        set failSpeechRealtime(value: boolean) {
+          flags.failSpeechRealtime = value;
+        },
         close: () =>
           new Promise<void>((done) => {
-            for (const client of wss.clients) client.terminate();
+            for (const client of [...wss.clients, ...speechWss.clients]) client.terminate();
             wss.close();
+            speechWss.close();
             httpServer.close(() => done());
           }),
       });

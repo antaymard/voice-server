@@ -4,6 +4,8 @@ import WebSocket from "ws";
 import type { ConverseServerEvent, ConverseStartMessage } from "../client/src/converseProtocol.ts";
 import { startServer, type RunningServer } from "../src/index.ts";
 import { createSentenceSplitter, toSpeakable } from "../src/converse/sentences.ts";
+import { classifyEcho } from "../src/converse/session.ts";
+import { createPcmDecoder, type PcmFormat } from "../src/converse/tts.ts";
 import { loadConfig } from "../src/config.ts";
 import { startMockMistral, type MockMistral } from "./mock-mistral.ts";
 import { startMockLlm, type MockLlm } from "./mock-llm.ts";
@@ -119,11 +121,13 @@ test("a spoken turn gets a spoken reply", async () => {
   assert.equal((await c.next("user_turn")).text, "salut toi");
   const done = await c.next("response_done");
   assert.equal(done.text, "Bonjour à toi. Comment ça va ?");
-  // Two sentences -> two TTS requests; the mock yields 9 bytes each, sent as
-  // whole 16-bit samples.
+  // The text is streamed into the realtime voice, one generation per
+  // sentence; the mock yields 9 bytes each, relayed as whole 16-bit samples.
   assert.equal(Buffer.concat(c.audio).toString(), "MOCKAUDIMOCKAUDI");
-  assert.equal(mistral.received.speech?.["voice_id"], "voice_592");
-  assert.equal(mistral.received.speech?.["response_format"], "pcm");
+  assert.deepEqual(mistral.received.speechRealtime, {
+    session: { response_format: "pcm", streaming_mode: "responsive", voice: "voice_592" },
+    generations: ["Bonjour à toi. ", "Comment ça va ?"],
+  });
   assert.ok(mistral.received.realtimeSession?.["turn_detection"]);
 
   const messages = messagesOf(0);
@@ -236,18 +240,66 @@ test("barge-in cuts the reply and the model remembers only what was heard", asyn
   await c.next("assistant_delta", 1);
   while (c.audio.length === 0) await sleep(10);
 
+  // A turn opening is not enough (it could be a cough): words are.
   c.turn("start");
+  await sleep(60);
+  assert.equal(c.events.some((e) => e.type === "interrupt" || e.type === "turn"), false);
+  c.say("attends ");
+  c.say("stop");
   const cut = await c.next("interrupt");
   assert.equal(cut.heardText, "Première phrase.");
-  c.say("stop");
+  assert.equal((await c.next("turn")).phase, "start"); // held events are released
   c.turn("end");
   await c.next("response_done");
   assert.deepEqual(messagesOf(1).slice(1), [
     { role: "user", content: "raconte" },
     { role: "assistant", content: "Première phrase." },
-    { role: "user", content: "stop" },
+    { role: "user", content: "attends stop" },
   ]);
   c.ws.close();
+});
+
+test("the assistant's own voice coming back through the mic does not interrupt it", async () => {
+  llm.script({ text: ["Voici la première phrase. ", "Et la suite arrive"], hangMs: 400 }, { text: ["Oui ?"] });
+  const c = await open();
+  await c.next("ready");
+  c.sendJson({ type: "text", text: "raconte" });
+  while (c.audio.length === 0) await sleep(10);
+
+  c.turn("start");
+  c.say("voici la ");
+  c.say("première phrase");
+  c.turn("end");
+  const done = await c.next("response_done");
+  assert.equal(done.text, "Voici la première phrase. Et la suite arrive");
+  assert.equal(c.events.some((e) => ["interrupt", "transcript", "turn"].includes(e.type)), false);
+  assert.equal(c.events.filter((e) => e.type === "user_turn").length, 1); // only the typed one
+
+  // Once it has finished speaking, the user is heard normally again.
+  await sleep(350);
+  c.turn("start");
+  c.say("première phrase");
+  c.turn("end");
+  assert.equal((await c.next("user_turn", 1)).text, "première phrase");
+  c.ws.close();
+});
+
+test("speech falls back to per-sentence requests when the realtime voice is down", async () => {
+  mistral.failSpeechRealtime = true;
+  try {
+    llm.script({ text: ["Première. Deuxième phrase ici."] });
+    const c = await open({ voice: "voice_592" });
+    await c.next("ready");
+    c.sendJson({ type: "text", text: "salut" });
+    await c.next("response_done");
+    assert.equal(Buffer.concat(c.audio).toString(), "MOCKAUDI");
+    assert.equal(mistral.received.speech?.["voice_id"], "voice_592");
+    assert.equal(mistral.received.speech?.["input"], "Première. Deuxième phrase ici.");
+    assert.equal(c.events.some((e) => e.type === "response_error"), false);
+    c.ws.close();
+  } finally {
+    mistral.failSpeechRealtime = false;
+  }
 });
 
 test("a tool slower than its response reports back when it finishes", async () => {
@@ -305,7 +357,8 @@ test("invalid start options are rejected", async () => {
 test("sentence splitter emits complete sentences and glues tiny ones", () => {
   const s = createSentenceSplitter();
   assert.deepEqual(s.push("Oui. Bien sûr, je m'en"), []);
-  assert.deepEqual(s.push(" occupe ! Ensuite"), ["Oui. Bien sûr, je m'en occupe !"]);
+  assert.deepEqual(s.push(" occupe ! Ensuite"), ["Oui. Bien sûr, je m'en occupe ! "]);
+  assert.equal(s.pending(), "Ensuite");
   assert.deepEqual(s.flush(), ["Ensuite"]);
   assert.equal(toSpeakable("**Voici** le `code` :"), "Voici le code :");
   assert.equal(toSpeakable("---"), "");
@@ -328,4 +381,37 @@ test("LLM providers and allowed models come from the environment", () => {
     { provider: "default", model: "mistral-large-latest" },
     { provider: "groq", model: "llama3:8b" },
   ]);
+});
+
+test("echo is told apart from someone talking over the assistant", () => {
+  const said = "Il fait beau à Paris aujourd'hui, avec vingt degrés.";
+  assert.equal(classifyEcho("il fait beau a paris", said), "echo");
+  assert.equal(classifyEcho("fait beau à Paris aujourd'hui vingt", said), "echo"); // garbled, still mostly it
+  assert.equal(classifyEcho("non attends", said), "speech");
+  assert.equal(classifyEcho("stop", said), "speech");
+  assert.equal(classifyEcho("Paris", said), "echo");
+  assert.equal(classifyEcho(" … ", said), "unknown");
+});
+
+test("raw pcm is recognized as 16-bit or float and always leaves as 16-bit", () => {
+  const samples = Array.from({ length: 400 }, (_, i) => Math.sin(i / 5) * 0.5);
+  const asFloat = Buffer.alloc(samples.length * 4);
+  const asInt = Buffer.alloc(samples.length * 2);
+  samples.forEach((v, i) => {
+    asFloat.writeFloatLE(v, i * 4);
+    asInt.writeInt16LE(Math.round(v * 32767), i * 2);
+  });
+
+  const floatFormat: PcmFormat = { encoding: "auto" };
+  const floatDecoder = createPcmDecoder(floatFormat);
+  // Split mid-sample: the decoder must reassemble it.
+  const out = [floatDecoder.push(asFloat.subarray(0, 401)), floatDecoder.push(asFloat.subarray(401)), floatDecoder.flush()];
+  assert.equal(floatFormat.encoding, "f32le");
+  assert.deepEqual(Buffer.concat(out.filter((b): b is Buffer => b !== null)), asInt);
+
+  const intFormat: PcmFormat = { encoding: "auto" };
+  const intDecoder = createPcmDecoder(intFormat);
+  const kept = [intDecoder.push(asInt), intDecoder.flush()];
+  assert.equal(intFormat.encoding, "s16le");
+  assert.deepEqual(Buffer.concat(kept.filter((b): b is Buffer => b !== null)), asInt);
 });

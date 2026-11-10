@@ -13,8 +13,14 @@ const MAX_CHARS = 240;
 const BOUNDARY = /[.!?…]+["'»)\]]*\s+|\n+/g;
 
 export type SentenceSplitter = {
-  /** Feed a text delta; returns the sentences it completes. */
+  /**
+   * Feed a text delta; returns the sentences it completes, with their
+   * original spacing (the returned sentences plus `pending()` always add up
+   * to the text pushed so far).
+   */
   push: (delta: string) => string[];
+  /** The unfinished sentence so far. */
+  pending: () => string;
   /** Returns whatever is left (call once the text is complete). */
   flush: () => string[];
 };
@@ -23,7 +29,7 @@ export function createSentenceSplitter(): SentenceSplitter {
   let buffer = "";
 
   const take = (end: number): string => {
-    const chunk = buffer.slice(0, end).trim();
+    const chunk = buffer.slice(0, end);
     buffer = buffer.slice(end);
     return chunk;
   };
@@ -47,7 +53,7 @@ export function createSentenceSplitter(): SentenceSplitter {
       }
       if (cut < 0) return out;
       const chunk = take(cut);
-      if (chunk) out.push(chunk);
+      if (chunk.trim()) out.push(chunk);
     }
   };
 
@@ -56,10 +62,11 @@ export function createSentenceSplitter(): SentenceSplitter {
       buffer += delta;
       return drain();
     },
+    pending: () => buffer,
     flush: () => {
-      const rest = buffer.trim();
+      const rest = buffer;
       buffer = "";
-      return rest ? [rest] : [];
+      return rest.trim() ? [rest] : [];
     },
   };
 }

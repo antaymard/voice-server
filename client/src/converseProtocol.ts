@@ -69,9 +69,9 @@ export type ConverseStartMessage = {
   /** Voice id for the assistant's speech; omit for the server default. */
   voice?: string;
   /**
-   * Let the user interrupt the assistant by speaking. Default true. Turn it
-   * off when the mic can hear the speakers (no echo cancellation): the
-   * assistant would otherwise interrupt itself.
+   * Let the user interrupt the assistant by speaking. Default true. The
+   * server ignores the assistant's own voice picked up by the mic; `false`
+   * ignores the mic entirely while the assistant speaks.
    */
   bargeIn?: boolean;
   /**

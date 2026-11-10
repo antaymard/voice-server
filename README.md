@@ -423,8 +423,16 @@ What the server does for you:
 - **Acts while the user speaks.** Tools declared `speculative` (read-only)
   are called during that early phase; tools with side effects wait for the
   turn to be final.
-- **Can be interrupted.** When the user speaks over the assistant, generation
-  and speech stop, and the model's memory keeps only what was actually heard.
+- **Can be interrupted — without headphones.** When the user speaks over the
+  assistant, generation and speech stop, and the model's memory keeps only
+  what was actually heard. A turn that starts while the assistant is audible
+  only counts once it carries words that aren't the assistant's own: its voice
+  leaking back through the mic, a cough or a door slam don't cut it off.
+  (Keep the browser's `echoCancellation` on as the first line of defense.)
+- **Speaks as it writes.** The reply's text is streamed into Voxtral's
+  realtime speech WebSocket word by word, so audio can start before the first
+  sentence is finished. If that connection fails, the server falls back to
+  one speech request per sentence.
 - **Doesn't block on slow tools.** A call that outlives `toolTimeoutMs` (or an
   interruption) keeps running in your app; the model says it's in progress,
   and reports the result when your `tool_result` arrives.
@@ -441,7 +449,7 @@ What the server does for you:
    | `history` | `[]` | `[{ role: "user" \| "assistant", content }]` to resume a conversation |
    | `provider`, `model` | server default | which LLM to use; must be allowed by the server (see below) |
    | `voice` | `TTS_VOICE` | voice id for the replies |
-   | `bargeIn` | `true` | let the user interrupt by speaking. Turn it off if the mic can hear the speakers: the assistant would interrupt itself |
+   | `bargeIn` | `true` | let the user interrupt by speaking. `false` ignores the mic entirely while the assistant speaks |
    | `speculate` | `true` | prepare the reply on `eager_end` |
    | `toolTimeoutMs` | `15000` | how long a response waits for a `tool_result` |
 
@@ -591,6 +599,8 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `LLM_MODEL` | no | `mistral-small-latest` | default conversation model |
 | `LLM_PROVIDER_<NAME>_BASE_URL` / `_API_KEY` | no | — | extra named LLM endpoints |
 | `LLM_MODELS` | no | — | models clients may pick: `model` or `provider:model`, comma-separated; `*` = any |
+| `CONVERSE_TTS` | no | `realtime` | how `/v1/converse` speaks: `realtime` (text streamed into Mistral's speech WebSocket, falls back to `http` on failure) or `http` (one request per sentence) |
+| `TTS_PCM_ENCODING` | no | `auto` | sample type of Mistral's raw `pcm` output for `/v1/converse`: `auto` (detected), `s16le` or `f32le` |
 | `CONVERSE_SETTLE_MS` | no | `150` | after a turn ends, wait for late transcript text before answering |
 | `GLADIA_API_KEY` | no | — | enables `/v1/gladia/*`; empty = those endpoints answer 503 |
 | `GLADIA_BULK_MODEL` | no | `solaria-1` | bulk model: `solaria-1` (clean/quiet, 100+ langs) or `solaria-3` (noisy, single language) |
@@ -668,10 +678,13 @@ on :9098 with `GLADIA_API_KEY=any GLADIA_BASE_URL=http://127.0.0.1:9098`).
 - Realtime (Mistral): `diarize` and `turnDetection` are mutually exclusive
   (Mistral limitation); realtime segments carry no timestamps.
 - Live conversation is a first version: no React hook yet (use
-  `public/converse.js` as the reference client), barge-in triggers on
-  Voxtral's `turn.start` (a cough can cut the assistant off), "what was
-  heard" is estimated from audio timing, and replies are spoken through
-  per-sentence `/audio/speech` calls rather than Voxtral TTS Realtime.
+  `public/converse.js` as the reference client). Interrupting waits for the
+  first transcribed word, so it lags by about `targetDelayMs`; a short
+  interjection made only of words the assistant just said ("oui" over a
+  reply containing "oui") is taken for echo and ignored. "What was heard" is
+  estimated from audio timing (the speech API has no timestamps). Each
+  sentence is its own speech generation, so intonation doesn't carry across
+  sentences.
 - Not exposed yet: Voxtral TTS Realtime 3 (`voxtral-mini-tts-realtime-3-0`,
   a live-conversation speech stream), TTS style instructions (not available
   at Mistral's launch), and Mistral's managed Voice Agents.
