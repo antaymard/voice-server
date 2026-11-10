@@ -620,7 +620,7 @@ assistant's speech** (PCM s16le mono 24 kHz, see `ready.audio`):
 | `assistant_delta` | `responseId, text` | reply text (arrives ahead of its audio) |
 | `tool_call` | `responseId, callId, name, arguments, speculative, early` | run it, answer with `tool_result`. `arguments` is a JSON string written by the model: validate it. `early`: decided mid-sentence (`responseId` is then `null`) |
 | `tool_cancel` | `callId` | a speculative call is no longer needed |
-| `response_done` | `responseId, text` | the reply is complete |
+| `response_done` | `responseId, text, speech?` | the reply is complete. `speech`: `realtime` or `http` — how it was spoken; `http` on a server set to `realtime` means the realtime voice is failing and the slower fallback took over |
 | `interrupt` | `responseId, heardText` | **stop playback and drop queued audio** |
 | `response_error` | `responseId, code, message` | `llm_error` / `tts_error`; the session goes on |
 | `error` | `code, message` | fatal, same codes as `/v1/realtime`, then close |
@@ -629,9 +629,12 @@ assistant's speech** (PCM s16le mono 24 kHz, see `ready.audio`):
 protocol with streaming and tool calls works. The default is Mistral
 (`mistral-small-latest`, with your `MISTRAL_API_KEY`).
 
-The shortest way to another model is OpenRouter: set `OPENROUTER_API_KEY`
-and the default becomes `anthropic/claude-haiku-5.5` through OpenRouter;
-pick anything else there with `LLM_MODEL=openrouter:<vendor>/<model>`.
+A voice conversation needs a fast first word more than depth, hence a small
+direct model by default (measured here: about 0.1 s to the first word with
+`mistral-small-latest`, about 0.75 s with Claude Haiku 5.5 through
+OpenRouter). To try another model, `OPENROUTER_API_KEY` adds an `openrouter`
+provider: `LLM_MODEL=openrouter:<vendor>/<model>` makes one the default, or
+list some in `LLM_MODELS` and let apps pick per conversation.
 
 To swap or add other endpoints:
 
@@ -741,7 +744,7 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `BATCH_MODEL` | no | `voxtral-mini-transcribe-3-0` | bulk transcription model (`voxtral-small-transcribe-3-0` = higher quality) |
 | `REALTIME_MODEL` | no | `voxtral-mini-transcribe-realtime-3-0` | realtime model |
 | `TTS_MODEL` | no | `voxtral-mini-tts-3-0` | text-to-speech model |
-| `TTS_VOICE` | no | — | default voice id (empty = Mistral's default) |
+| `TTS_VOICE` | no | set in the `Dockerfile` | default voice id for `/v1/speak` and `/v1/converse`. The image sets this deployment's voice (a custom voice of its Mistral account, used for every language: a Voxtral voice is not tied to one); a variable on the host overrides it. Unset outside Docker = Mistral's default |
 | `TTS_FORMAT` | no | `pcm` | default output format when the request omits one |
 | `MAX_TTS_CHARS` | no | `8000` | max characters per `/v1/speak` request |
 | `MAX_UPLOAD_BYTES` | no | `26214400` (25 MB) | bulk upload cap (also caps `/v1/speak` bodies) |
@@ -753,7 +756,7 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `MISTRAL_WS_URL` | no | `wss://api.mistral.ai` | upstream override (tests/mock) |
 | `LLM_BASE_URL` | no | Mistral (`…/v1`) | `/v1/converse`: default chat-completions endpoint |
 | `LLM_API_KEY` | no | `MISTRAL_API_KEY` | key for that endpoint |
-| `OPENROUTER_API_KEY` | no | — | enables `/v1/decide` and the conversation's fast decisions; adds the `openrouter` LLM provider; if `LLM_MODEL` and `LLM_BASE_URL` are unset, it becomes the default with `anthropic/claude-haiku-5.5` |
+| `OPENROUTER_API_KEY` | no | — | enables `/v1/decide` and the conversation's fast decisions; adds the `openrouter` LLM provider (not the default: see `LLM_MODEL`) |
 | `LLM_MODEL` | no | `mistral-small-latest` | default conversation model: `model` or `provider:model` (e.g. `openrouter:anthropic/claude-haiku-5.5`) |
 | `LLM_PROVIDER_<NAME>_BASE_URL` / `_API_KEY` | no | — | extra named LLM endpoints |
 | `LLM_MODELS` | no | — | models clients may pick: `model` or `provider:model`, comma-separated; `*` = any |

@@ -154,8 +154,6 @@ function parseHostList(raw: string | undefined): string[] {
 
 const PROVIDER_ENV = /^LLM_PROVIDER_([A-Z0-9_]+)_BASE_URL$/;
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
-/** Used when an OpenRouter key is the only LLM setting given. */
-const OPENROUTER_DEFAULT_MODEL = "anthropic/claude-haiku-5.5";
 
 /**
  * `model` (default provider) or `provider:model`. Model ids can contain ":"
@@ -245,13 +243,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   }
 
   const llmProviders = loadLlmProviders(env);
-  // An explicit LLM_MODEL (or a custom default endpoint) wins; otherwise an
-  // OpenRouter key alone is taken as "use OpenRouter".
-  const defaultLlm = env["LLM_MODEL"]
-    ? parseModelRef(env["LLM_MODEL"], llmProviders)
-    : llmProviders["openrouter"] && !env["LLM_BASE_URL"]
-      ? { provider: "openrouter", model: OPENROUTER_DEFAULT_MODEL }
-      : { provider: "default", model: "mistral-small-latest" };
+  // The voice needs a fast first word more than depth: a small direct model
+  // by default. An OpenRouter key adds the `openrouter` provider (and the
+  // decision model) without changing this; pick another model with LLM_MODEL.
+  const defaultLlm = parseModelRef(env["LLM_MODEL"] || "mistral-small-latest", llmProviders);
 
   const converseTts = env["CONVERSE_TTS"] || "realtime";
   if (converseTts !== "realtime" && converseTts !== "http") {

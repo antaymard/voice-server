@@ -85,10 +85,32 @@ const VOICE_PREAMBLE =
   "its result will be given to you when it arrives. A message starting with [App event] comes from the " +
   "application, not from the user: never answer it as if the user had said it.";
 
-const EVENT_TO_TELL =
-  "[App event — information from the application, not something the user said. If it is worth saying " +
-  "aloud now, tell the user in one short sentence; if it is not, reply with nothing at all.]";
-const EVENT_TO_KEEP = "[App event — background information from the application, not said by the user. No reply is expected.]";
+// How an app event is shown to the model: as plain context, with no
+// instruction in it. Events stay in the conversation and often sit right
+// before something the user says; an instruction such as "reply with nothing
+// if this is not worth saying" would then silence the answer to the user.
+const EVENT_CONTEXT = "[App event — information from the application, not something the user said]";
+const EVENT_END = "[End of app event]";
+
+/**
+ * Added to the system prompt only for a reply nobody asked for: the
+ * assistant woken up by news from the app (an event, a late tool result).
+ */
+const WAKE_PREAMBLE =
+  "You are speaking up on your own: the user has not just said anything. The latest [App event] or " +
+  "tool result above is news from the application. If it is worth saying aloud now, tell the user in " +
+  "one short sentence; if it is not, output nothing at all.";
+
+/** Something to show the model with its next turn that nobody said aloud. */
+type Note =
+  /** The result of a tool call that outlived its response. */
+  | { kind: "tool"; text: string }
+  /** Something the app reported (cf. the `event` client message). */
+  | { kind: "event"; text: string };
+
+function renderNote(note: Note): string {
+  return note.kind === "tool" ? note.text : `${EVENT_CONTEXT}\n${note.text}\n${EVENT_END}`;
+}
 
 const LISTENING_PREAMBLE =
   "LISTENING MODE. The user is still speaking: their last message is unfinished and may stop " +
@@ -101,6 +123,12 @@ const EARLY_MIN_NEW_WORDS = 4;
 /** …and a clause boundary, or this many words without one. */
 const EARLY_MAX_NEW_WORDS = 10;
 const CLAUSE_BOUNDARY = /[,;:.!?…]/;
+/**
+ * Probability of "there is something to act on" above which the LLM is woken.
+ * Kept low on purpose: the LLM is the real judge, so a false alarm only costs
+ * one call, while a miss costs the head start.
+ */
+const GATE_OPENS_AT = 0.35;
 /** With a decision model as gatekeeper, looking is cheap: do it this often. */
 const GATED_MIN_NEW_WORDS = 2;
 /** Below this probability of "the user has finished", the turn is held open… */
@@ -185,6 +213,8 @@ type ResponseState = {
   finalMessage: AssistantMessage | null;
   ttsChain: Promise<void>;
   ttsFailed: boolean;
+  /** How the audio sent so far was produced (cf. `ResponseDoneEvent.speech`). */
+  speechVia: "realtime" | "http" | null;
   /** Estimated time (ms) the audio sent so far finishes playing. */
   playhead: number;
   onCommit: Array<() => void>;
@@ -296,9 +326,13 @@ export function runConverseSession(
   /** Calls whose response moved on; value = tool name. */
   const lateCalls = new Map<string, string>();
   /** Results of such calls, waiting to be shown to the model on its next turn. */
-  let lateResults: string[] = [];
+  let lateResults: Note[] = [];
   /** Some of `lateResults` are waiting for the assistant to speak up about them. */
   let newsToTell = false;
+  /** The early look under way has reached the LLM (it is past the decision model). */
+  let earlyLookAtLlm = false;
+  /** A pause asked for a speculative reply while that look was still running. */
+  let speculateAfterLook = false;
   /** Tool calls made while the user was still speaking, for the turn in progress. */
   let turnActions: { call: ToolCall; result: string | null }[] = [];
   /** The look at the unfinished sentence that is under way, if any. */
@@ -414,7 +448,7 @@ export function runConverseSession(
 
   /** Called when a response becomes real: its context joins the history. */
   const openTurn = (userText: string | null): void => {
-    for (const content of lateResults) history.push({ role: "user", content });
+    for (const note of lateResults) history.push({ role: "user", content: renderNote(note) });
     lateResults = [];
     newsToTell = false;
     if (userText) {
@@ -461,12 +495,14 @@ export function runConverseSession(
     const pending: ChatMessage[] = response.committed
       ? []
       : [
-          ...lateResults.map((content) => ({ role: "user" as const, content })),
+          ...lateResults.map((note) => ({ role: "user" as const, content: renderNote(note) })),
           ...(response.userText ? [{ role: "user" as const, content: response.userText }] : []),
           ...(response.userText ? actionMessages() : []),
           ...response.buffered,
         ];
-    return [{ role: "system", content: systemPrompt }, ...mergeUserMessages([...history, ...pending])];
+    // No user turn behind this reply: the assistant is speaking up on its own.
+    const system = response.userText === null ? `${systemPrompt}\n\n${WAKE_PREAMBLE}` : systemPrompt;
+    return [{ role: "system", content: system }, ...mergeUserMessages([...history, ...pending])];
   };
 
   /** Free the "assistant is speaking" slot once the audio has played out. */
@@ -491,6 +527,7 @@ export function runConverseSession(
           const segment = (segments[item.segment] ??= { text: "", bytes: 0, complete: false, chunks: [] });
           segment.text = item.text;
           if (item.audio) {
+            response.speechVia = stream.via();
             segment.bytes += item.audio.length;
             emit(response, { audio: item.audio, segment });
           }
@@ -630,7 +667,14 @@ export function runConverseSession(
     response.phase = "done";
     await response.ttsChain;
     if (signal.aborted) return;
-    emit(response, { event: { type: "response_done", responseId: response.id, text: response.text } });
+    emit(response, {
+      event: {
+        type: "response_done",
+        responseId: response.id,
+        text: response.text,
+        ...(response.speechVia ? { speech: response.speechVia } : {}),
+      },
+    });
     if (response.committed) scheduleClear(response);
   };
 
@@ -685,6 +729,8 @@ export function runConverseSession(
     // From here the reply handles the request: no second opinion in parallel.
     earlyPass?.abort();
     earlyPass = null;
+    earlyLookAtLlm = false;
+    speculateAfterLook = false;
     const response: ResponseState = {
       id: randomUUID(),
       abort: new AbortController(),
@@ -699,6 +745,7 @@ export function runConverseSession(
       finalMessage: null,
       ttsChain: Promise.resolve(),
       ttsFailed: false,
+      speechVia: null,
       playhead: 0,
       onCommit: [],
       clearTimer: null,
@@ -779,6 +826,7 @@ export function runConverseSession(
     const text = userBuffer.trim();
     wordsSeenEarly = wordsOf(text).length;
     wordsSeenByLlm = wordsSeenEarly;
+    earlyLookAtLlm = true;
     try {
       const calls: ToolCall[] = [];
       const stream = deps.llm({
@@ -788,7 +836,7 @@ export function runConverseSession(
           { role: "system", content: `${systemPrompt}\n\n${LISTENING_PREAMBLE}` },
           ...mergeUserMessages([
             ...history,
-            ...lateResults.map((content) => ({ role: "user" as const, content })),
+            ...lateResults.map((note) => ({ role: "user" as const, content: renderNote(note) })),
             { role: "user", content: text },
           ]),
           ...actionMessages(),
@@ -822,7 +870,17 @@ export function runConverseSession(
     } finally {
       if (earlyPass === controller) {
         earlyPass = null;
-        considerEarlyLook(""); // words kept coming meanwhile
+        earlyLookAtLlm = false;
+        if (speculateAfterLook) {
+          // The pause that wanted a reply prepared is still on: prepare it now,
+          // knowing what was just done.
+          speculateAfterLook = false;
+          if (pausing && !current && !suspect && params?.speculate && userBuffer.trim()) {
+            startResponse(userBuffer.trim(), false);
+          }
+        } else {
+          considerEarlyLook(""); // words kept coming meanwhile
+        }
       }
     }
   };
@@ -842,7 +900,7 @@ export function runConverseSession(
     earlyPass = null;
     const go =
       answer?.type === "noul"
-        ? answer.noul >= 0.5
+        ? answer.noul >= GATE_OPENS_AT
         : total - wordsSeenByLlm >= EARLY_MAX_NEW_WORDS; // no verdict: fall back to looking now and then
     if (go && !current && !suspect) void lookEarly();
     else considerEarlyLook("");
@@ -1020,11 +1078,17 @@ export function runConverseSession(
       case "eager_end":
         pausing = true;
         askCompleteness();
-        if (!suspect && params?.speculate && !current && userBuffer.trim()) {
+        if (earlyLookAtLlm) {
+          // The model is already deciding on an action for this sentence. Preparing
+          // the reply now would cancel that and redo it after the turn ends; let
+          // it finish first (it takes about as long as the pause itself).
+          speculateAfterLook = true;
+        } else if (!suspect && params?.speculate && !current && userBuffer.trim()) {
           startResponse(userBuffer.trim(), false);
         }
         return;
       case "resume":
+        speculateAfterLook = false;
         if (current && !current.committed) discardSpeculative(current);
         return;
       case "end": {
@@ -1056,9 +1120,10 @@ export function runConverseSession(
     if (!name) return; // cancelled, or never asked for
     lateCalls.delete(callId);
     newsToTell = true;
-    lateResults.push(
-      `[Tool result — "${name}" (call ${callId}) has finished${isError ? " with an error" : ""}]\n${output}`,
-    );
+    lateResults.push({
+      kind: "tool",
+      text: `[Tool result — "${name}" (call ${callId}) has finished${isError ? " with an error" : ""}]\n${output}`,
+    });
     followUpIfIdle();
   };
 
@@ -1150,7 +1215,7 @@ export function runConverseSession(
         if (!text) return;
         const silent = message.speak === "never";
         // Shown to the model with whatever it is told next, like a late tool result.
-        lateResults.push(`${silent ? EVENT_TO_KEEP : EVENT_TO_TELL}\n${text}`);
+        lateResults.push({ kind: "event", text });
         if (lateResults.length > MAX_PENDING_EVENTS) lateResults.shift();
         if (silent) return;
         newsToTell = true;
