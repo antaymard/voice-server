@@ -607,7 +607,11 @@ server: it is ears and mouth for an agent that lives in your app. Each
 finished turn arrives as `user_turn`; you answer by sending the reply's text
 as it is written — `{ "type": "say", "id", "text" }`, several times with the
 same `id`, the last one with `"done": true`. The server speaks it sentence by
-sentence, and still handles turn-taking, barge-in and echo. If the user talks
+sentence, and still handles turn-taking, barge-in and echo. A `say` that
+arrives while a previous one is still being spoken — the same `id` reopened
+after `done`, or a new `id` — is spoken after it, never over it (an agent
+writes, works, then writes again); they share one `responseId`, and each
+gets its own `response_start` and `response_done`. If the user talks
 over a reply, you get `interrupt` with its `sayId`, and anything else sent
 under that `id` is dropped (keep streaming, the server sorts it out); a reply
 does not start while the user is speaking either. `response_start`,
