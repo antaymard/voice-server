@@ -302,6 +302,47 @@ test("it acts in the middle of the user's sentence, and the reply knows what was
   c.ws.close();
 });
 
+test("an event the user talks over is context too, never a licence to stay silent", async () => {
+  llm.script({ text: ["Je t'écoute."] });
+  const c = await open();
+  await c.next("ready");
+  c.turn("start");
+  c.say("attends deux secondes");
+  await c.next("transcript"); // the user is audibly speaking by now
+  c.sendJson({ type: "event", text: "Run finished." }); // would be told, but not over the user
+  c.turn("end");
+  await c.next("response_done");
+  const request = messagesOf(llm.requests.length - 1);
+  assert.doesNotMatch(JSON.stringify(request), /output nothing|speaking up on your own/);
+  assert.match(String(request.at(-1)?.["content"]), /Run finished\.\n\[End of app event\]\nattends deux secondes$/);
+  assert.equal(llm.requests.length, 1);
+  c.ws.close();
+});
+
+test("a pause does not cancel an action the model is already deciding on", async () => {
+  // The early look is slow (as a real model is): the pause arrives while it runs.
+  llm.script(
+    { delayMs: 200, toolCalls: [{ id: "slow_early", name: "set_color", arguments: '{"color":"red"}' }] },
+    { text: ["C'est rouge."] },
+  );
+  const c = await open({ tools: [{ name: "set_color", immediate: true }] });
+  await c.next("ready");
+  c.turn("start");
+  c.say("mets la page en rouge");
+  c.say(",");
+  await sleep(40); // the look has started
+  c.turn("eager_end");
+  const call = await c.next("tool_call");
+  assert.equal(call.early, true); // decided before the turn ended, not redone after
+  assert.equal(c.events.some((e) => e.type === "user_turn"), false);
+  c.sendJson({ type: "tool_result", callId: call.callId, output: '{"ok":true}' });
+  c.turn("end");
+  assert.equal((await c.next("response_done")).text, "C'est rouge.");
+  assert.equal(c.events.filter((e) => e.type === "tool_call").length, 1);
+  assert.equal(llm.requests.length, 2); // one look, one reply: nothing thrown away
+  c.ws.close();
+});
+
 test("without tools allowed to run early, the model is only consulted once the user is done", async () => {
   llm.script({ text: ["D'accord."] });
   const c = await open({ tools: [{ name: "send_email" }] });
@@ -417,8 +458,15 @@ test("an app event makes the assistant speak up without the user saying anything
   assert.equal(c.events.some((e) => e.type === "user_turn"), false); // nobody spoke
   const last = messagesOf(0).at(-1);
   assert.equal(last?.["role"], "user");
-  assert.match(String(last?.["content"]), /^\[App event — information from the application[\s\S]*Run finished: the export node was created\.$/);
-  assert.match(String(messagesOf(0)[0]?.["content"]), /\[App event\] comes from the application/);
+  assert.equal(
+    last?.["content"],
+    "[App event — information from the application, not something the user said]\n" +
+      "Run finished: the export node was created.\n[End of app event]",
+  );
+  // "Say it or stay silent" lives in the system prompt of this reply only.
+  const system = String(messagesOf(0)[0]?.["content"]);
+  assert.match(system, /\[App event\] comes from the application/);
+  assert.match(system, /You are speaking up on your own[\s\S]*output nothing at all\.$/);
   c.ws.close();
 });
 
@@ -431,8 +479,14 @@ test("a silent app event is only context for the next reply", async () => {
   assert.equal(llm.requests.length, 0); // nothing said, the LLM was not even called
   c.sendJson({ type: "text", text: "c'est quoi ce node ?" });
   await c.next("response_done");
-  const user = String(messagesOf(0).at(-1)?.["content"]);
-  assert.match(user, /^\[App event — background information[\s\S]*« Budget »\.\nc'est quoi ce node \?$/);
+  // Travelling with a user turn, the event is plain context: nothing in it may
+  // read as an instruction about how to answer the user.
+  assert.equal(
+    messagesOf(0).at(-1)?.["content"],
+    "[App event — information from the application, not something the user said]\n" +
+      "The user selected the node « Budget ».\n[End of app event]\nc'est quoi ce node ?",
+  );
+  assert.doesNotMatch(String(messagesOf(0)[0]?.["content"]), /speaking up on your own/);
   c.ws.close();
 });
 
