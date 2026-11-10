@@ -40,7 +40,8 @@ with optional [Gladia](https://docs.gladia.io)-backed alternatives.
   recording (audio or video, up to hours), re-encodes it to light mono mp3/ogg
   and splits it into ~20 min parts cut in silences, so a 25 MB-capped STT
   can transcribe it part by part. Pure media processing (ffmpeg) — no STT.
-- One shared token for all your apps + an origin allowlist; your
+- One server token for your backends, short-lived scoped **session tokens**
+  for browsers (`/v1/tokens`), and an origin allowlist; your
   `MISTRAL_API_KEY`/`GLADIA_API_KEY` never leave the server.
 - Ships a copyable **React kit** (`client/`) — mic capture worklet,
   `useRealtimeTranscription` hook, `transcribeFile`, `synthesizeSpeech` and
