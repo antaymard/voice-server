@@ -666,6 +666,10 @@ npm run typecheck
 npm run build && npm start
 ```
 
+CI (`.github/workflows/ci.yml`) runs the typecheck, the build, the tests
+(with ffmpeg, so the media end-to-end tests run) and a Docker image build on
+every push.
+
 The test suite needs no API keys: `test/mock-mistral.ts` emulates the Mistral
 batch endpoint and realtime WebSocket, `test/mock-gladia.ts` the Gladia
 upload/pre-recorded/live surface (`npm run mock:gladia` to run it standalone
