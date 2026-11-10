@@ -65,6 +65,54 @@ npm run mock           # mock Mistral API on :9099
 MISTRAL_BASE_URL=http://127.0.0.1:9099 MISTRAL_WS_URL=ws://127.0.0.1:9099 npm run dev
 ```
 
+## API overview
+
+Everything the server exposes, in one place. Each line links to its details.
+
+**HTTP** — JSON in, JSON out unless noted.
+
+| Endpoint | What it does | Needs |
+|---|---|---|
+| [`POST /v1/transcribe`](#post-v1transcribe--bulk-transcription) | Transcribe a complete audio file or URL (speaker labels, vocabulary biasing) | — |
+| [`POST /v1/speak`](#post-v1speak--text-to-speech) | Text to speech; the response body is the raw audio, streamed | — |
+| [`GET /v1/voices`](#get-v1voices--list-tts-voices) | List the voices `/v1/speak` and `/v1/converse` can use | — |
+| [`POST /v1/decide`](#post-v1decide--fast-typed-decisions) | Ask a decision model typed questions (yes/no, choice, score) about a state | `OPENROUTER_API_KEY` |
+| [`POST /v1/gladia/transcribe`](#post-v1gladiatranscribe--bulk-transcription-gladia) | Bulk transcription through Gladia (summaries, subtitles, async jobs) | `GLADIA_API_KEY` |
+| [`GET /v1/gladia/transcribe/:id`](#get-v1gladiatranscribeid--poll-an-async-job) | Poll an async Gladia job | `GLADIA_API_KEY` |
+| [`POST /v1/media/audio-parts`](#post-v1mediaaudio-parts--prepare-a-long-file-for-transcription) | Start a job that extracts and splits a long recording into STT-sized parts | `MEDIA_ALLOWED_SOURCE_HOSTS` |
+| `GET /v1/media/audio-parts/:id` | Job status and the list of parts | same |
+| `GET /v1/media/audio-parts/:id/parts/:index` | Download one part (audio bytes) | same |
+| `DELETE /v1/media/audio-parts/:id` | Cancel a job and delete its files | same |
+| [`GET /healthz`](#get-healthz) | Liveness and counters; no auth | — |
+| `GET /`, `/converse.html` | Demo pages (transcription, live conversation); static and public | — |
+
+**WebSocket** — the client sends one JSON `start` frame, then binary
+frames of mic audio (PCM s16le mono); the server answers with JSON events.
+
+| Endpoint | What it does | Needs |
+|---|---|---|
+| [`/v1/realtime`](#realtime-websocket--get-v1realtime) | Live transcription: text deltas, turn detection, speaker labels | — |
+| [`/v1/converse`](#live-conversation-websocket--get-v1converse) | Live voice conversation: the server listens, has an LLM decide and call your tools, and sends the spoken reply back as binary audio | — (`OPENROUTER_API_KEY` adds fast decisions and OpenRouter models) |
+| [`/v1/gladia/realtime`](#gladia-realtime-websocket--get-v1gladiarealtime) | Live transcription through Gladia | `GLADIA_API_KEY` |
+
+**Rules that apply everywhere**
+
+- **Auth**: one shared token. HTTP sends `Authorization: Bearer <AUTH_TOKEN>`;
+  WebSockets pass it as `?token=<AUTH_TOKEN>` (browsers can't set headers on
+  a WebSocket).
+- **Origins**: a browser request must come from an origin listed in
+  `ALLOWED_ORIGINS` (the server's own pages always pass). Requests without
+  an `Origin` header (servers, curl, native apps) rely on the token alone.
+- **Errors**: HTTP errors are always `{ "error": { "code", "message" } }`.
+  A WebSocket sends `{ "type": "error", "code", "message" }` and then closes;
+  close codes `1000`, `1001` and `4400` mean "don't reconnect".
+- **Disabled features** answer `503` (HTTP) or refuse the upgrade with `503`
+  (WebSocket) until their variable in the "Needs" column is set.
+- **Types**: the wire formats of the WebSocket endpoints are TypeScript files
+  you can copy into an app — [`client/src/protocol.ts`](client/src/protocol.ts)
+  (`/v1/realtime`), [`client/src/converseProtocol.ts`](client/src/converseProtocol.ts)
+  (`/v1/converse`), [`client/src/gladiaProtocol.ts`](client/src/gladiaProtocol.ts).
+
 ## HTTP API
 
 All `/v1/*` endpoints require `Authorization: Bearer <AUTH_TOKEN>`.
