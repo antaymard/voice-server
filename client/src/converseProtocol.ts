@@ -24,6 +24,8 @@ export const MAX_INSTRUCTIONS_CHARS = 20_000;
 export const MAX_HISTORY_MESSAGES = 100;
 export const MAX_TOOL_OUTPUT_CHARS = 50_000;
 export const MAX_TEXT_CHARS = 8_000;
+/** App events waiting to be shown to the model; beyond this the oldest are dropped. */
+export const MAX_PENDING_EVENTS = 20;
 export const DEFAULT_TOOL_TIMEOUT_MS = 15_000;
 export const MAX_TOOL_TIMEOUT_MS = 120_000;
 
@@ -120,6 +122,20 @@ export type ToolResultMessage = {
 /** A typed user message: handled like a finished spoken turn. */
 export type TextMessage = { type: "text"; text: string };
 
+/**
+ * Something happened in the app that the assistant should know, without the
+ * user having said it: a background job progressed or finished, another
+ * agent has a question, the user selected something… The text joins the
+ * conversation as information from the app, not as the user's words.
+ *
+ * `speak` says what the assistant may do with it:
+ * - `"when_idle"` (default): tell the user as soon as nobody is talking — or
+ *   say nothing, if it judges the news not worth saying aloud;
+ * - `"now"`: same, but cut its own speech short to do so (never the user's);
+ * - `"never"`: background information only, used in its later replies.
+ */
+export type EventMessage = { type: "event"; text: string; speak?: "when_idle" | "now" | "never" };
+
 /** Stop the assistant's current response (e.g. a "stop" button). */
 export type InterruptMessage = { type: "interrupt" };
 
@@ -130,6 +146,7 @@ export type ConverseClientMessage =
   | ConverseStartMessage
   | ToolResultMessage
   | TextMessage
+  | EventMessage
   | InterruptMessage
   | ConverseStopMessage;
 
@@ -266,6 +283,12 @@ export function parseConverseClientMessage(raw: string): ConverseClientMessage |
       return { type: "tool_result", callId: msg["callId"], output: msg["output"], isError: msg["isError"] };
     case "text":
       return typeof msg["text"] === "string" ? { type: "text", text: msg["text"] } : null;
+    case "event": {
+      const speak = msg["speak"];
+      if (typeof msg["text"] !== "string") return null;
+      if (speak !== undefined && speak !== "when_idle" && speak !== "now" && speak !== "never") return null;
+      return { type: "event", text: msg["text"], ...(speak ? { speak } : {}) };
+    }
     case "interrupt":
       return { type: "interrupt" };
     case "stop":

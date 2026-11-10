@@ -408,6 +408,62 @@ test("a tool slower than its response reports back when it finishes", async () =
   c.ws.close();
 });
 
+test("an app event makes the assistant speak up without the user saying anything", async () => {
+  llm.script({ text: ["Nolë a terminé l'export."] });
+  const c = await open();
+  await c.next("ready");
+  c.sendJson({ type: "event", text: "Run finished: the export node was created." });
+  assert.equal((await c.next("response_done")).text, "Nolë a terminé l'export.");
+  assert.equal(c.events.some((e) => e.type === "user_turn"), false); // nobody spoke
+  const last = messagesOf(0).at(-1);
+  assert.equal(last?.["role"], "user");
+  assert.match(String(last?.["content"]), /^\[App event — information from the application[\s\S]*Run finished: the export node was created\.$/);
+  assert.match(String(messagesOf(0)[0]?.["content"]), /\[App event\] comes from the application/);
+  c.ws.close();
+});
+
+test("a silent app event is only context for the next reply", async () => {
+  llm.script({ text: ["Le node Budget."] });
+  const c = await open();
+  await c.next("ready");
+  c.sendJson({ type: "event", text: "The user selected the node « Budget ».", speak: "never" });
+  await sleep(120);
+  assert.equal(llm.requests.length, 0); // nothing said, the LLM was not even called
+  c.sendJson({ type: "text", text: "c'est quoi ce node ?" });
+  await c.next("response_done");
+  const user = String(messagesOf(0).at(-1)?.["content"]);
+  assert.match(user, /^\[App event — background information[\s\S]*« Budget »\.\nc'est quoi ce node \?$/);
+  c.ws.close();
+});
+
+test("an app event waits for the assistant to finish, unless it is urgent", async () => {
+  llm.script(
+    { text: ["Une longue réponse. ", "Elle continue encore"], hangMs: 500 },
+    { text: ["Au fait, c'est prêt."] },
+    { text: ["Autre longue réponse. ", "Qui continue"], hangMs: 2000 },
+    { text: ["Attention, erreur."] },
+  );
+  const c = await open();
+  await c.next("ready");
+
+  c.sendJson({ type: "text", text: "raconte" });
+  while (c.audio.length === 0) await sleep(10);
+  c.sendJson({ type: "event", text: "Background job done." });
+  // The first reply is not cut: it finishes, then the news is told.
+  assert.equal((await c.next("response_done")).text, "Une longue réponse. Elle continue encore");
+  assert.equal((await c.next("response_done", 1)).text, "Au fait, c'est prêt.");
+  assert.equal(c.events.some((e) => e.type === "interrupt"), false);
+
+  await sleep(350);
+  const audioBefore = c.audio.length;
+  c.sendJson({ type: "text", text: "encore" });
+  while (c.audio.length === audioBefore) await sleep(10);
+  c.sendJson({ type: "event", text: "The run failed.", speak: "now" });
+  await c.next("interrupt"); // urgent: the assistant cuts itself short
+  assert.equal((await c.next("response_done", 2)).text, "Attention, erreur.");
+  c.ws.close();
+});
+
 test("the LLM is chosen per conversation, within what the server allows", async () => {
   const ok = await open({ provider: "other", model: "big-model" });
   assert.equal((await ok.next("ready")).llmProvider, "other");

@@ -30,6 +30,7 @@ import { randomUUID } from "node:crypto";
 import type WebSocket from "ws";
 import type { RealtimeTranscription } from "@mistralai/mistralai/extra/realtime";
 import {
+  MAX_PENDING_EVENTS,
   MAX_TEXT_CHARS,
   MAX_TOOL_OUTPUT_CHARS,
   normalizeConverseStart,
@@ -81,7 +82,13 @@ const VOICE_PREAMBLE =
   "and answer in the user's language. The user's words come from live speech recognition and may " +
   "contain transcription errors. If you were interrupted, your previous message only holds what the " +
   "user actually heard. A tool result marked as pending is still running: say so briefly and carry on; " +
-  "its result will be given to you when it arrives.";
+  "its result will be given to you when it arrives. A message starting with [App event] comes from the " +
+  "application, not from the user: never answer it as if the user had said it.";
+
+const EVENT_TO_TELL =
+  "[App event — information from the application, not something the user said. If it is worth saying " +
+  "aloud now, tell the user in one short sentence; if it is not, reply with nothing at all.]";
+const EVENT_TO_KEEP = "[App event — background information from the application, not said by the user. No reply is expected.]";
 
 const LISTENING_PREAMBLE =
   "LISTENING MODE. The user is still speaking: their last message is unfinished and may stop " +
@@ -290,6 +297,8 @@ export function runConverseSession(
   const lateCalls = new Map<string, string>();
   /** Results of such calls, waiting to be shown to the model on its next turn. */
   let lateResults: string[] = [];
+  /** Some of `lateResults` are waiting for the assistant to speak up about them. */
+  let newsToTell = false;
   /** Tool calls made while the user was still speaking, for the turn in progress. */
   let turnActions: { call: ToolCall; result: string | null }[] = [];
   /** The look at the unfinished sentence that is under way, if any. */
@@ -407,6 +416,7 @@ export function runConverseSession(
   const openTurn = (userText: string | null): void => {
     for (const content of lateResults) history.push({ role: "user", content });
     lateResults = [];
+    newsToTell = false;
     if (userText) {
       history.push({ role: "user", content: userText });
       // What was already done mid-sentence follows the user's words, as if
@@ -722,7 +732,7 @@ export function runConverseSession(
 
   /** A late tool result landed while nobody was speaking: report it. */
   function followUpIfIdle(): void {
-    if (!finished && isIdle() && lateResults.length > 0) startResponse(null, true);
+    if (!finished && isIdle() && newsToTell && lateResults.length > 0) startResponse(null, true);
   }
 
   // --- User side ------------------------------------------------------------
@@ -1045,6 +1055,7 @@ export function runConverseSession(
     const name = lateCalls.get(callId);
     if (!name) return; // cancelled, or never asked for
     lateCalls.delete(callId);
+    newsToTell = true;
     lateResults.push(
       `[Tool result — "${name}" (call ${callId}) has finished${isError ? " with an error" : ""}]\n${output}`,
     );
@@ -1132,6 +1143,20 @@ export function runConverseSession(
         dropTurn(); // typing overrides whatever the mic was picking up
         send({ type: "user_turn", text });
         startResponse(text, true);
+        return;
+      }
+      case "event": {
+        const text = message.text.trim().slice(0, MAX_TEXT_CHARS);
+        if (!text) return;
+        const silent = message.speak === "never";
+        // Shown to the model with whatever it is told next, like a late tool result.
+        lateResults.push(`${silent ? EVENT_TO_KEEP : EVENT_TO_TELL}\n${text}`);
+        if (lateResults.length > MAX_PENDING_EVENTS) lateResults.shift();
+        if (silent) return;
+        newsToTell = true;
+        // Urgent news may cut the assistant's own speech, never the user's.
+        if (message.speak === "now" && current?.committed && !turnOpen) interrupt(current);
+        followUpIfIdle();
         return;
       }
       case "interrupt":
