@@ -19,8 +19,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type WebSocket from "ws";
-import type { RawData } from "ws";
-import type { RealtimeConnection, RealtimeTranscription } from "@mistralai/mistralai/extra/realtime";
+import type { RealtimeTranscription } from "@mistralai/mistralai/extra/realtime";
 import {
   MAX_TEXT_CHARS,
   MAX_TOOL_OUTPUT_CHARS,
@@ -40,15 +39,13 @@ import {
   type TurnPhase,
 } from "../../client/src/protocol.ts";
 import type { Config } from "../config.ts";
-import { sendRawSessionUpdate } from "../mistral.ts";
+import { toSessionUpdate } from "../realtime/bridge.ts";
+import { connectTranscription, rawDataToBuffer, type Transcription } from "../realtime/upstream.ts";
 import { resolveLlm, type ChatMessage, type Llm, type ToolCall } from "./llm.ts";
 import { TTS_BYTES_PER_SECOND, TTS_SAMPLE_RATE, type Tts, type TtsStream } from "./tts.ts";
 
 export type ConverseDeps = { realtime: RealtimeTranscription; llm: Llm; tts: Tts };
 
-const CONNECT_TIMEOUT_MS = 10_000;
-const MAX_PENDING_SENDS = 200;
-const MAX_PREREADY_BUFFER_BYTES = 512 * 1024;
 const MAX_CLIENT_BUFFERED_BYTES = 8 * 1024 * 1024;
 /** LLM turns per response (each tool round-trip costs one). */
 const MAX_ROUNDS = 6;
@@ -74,13 +71,6 @@ const PENDING_TOOL_OUTPUT = JSON.stringify({
   status: "pending",
   note: "Still running. The result will be provided later in the conversation.",
 });
-
-const TURN_PHASES: Record<string, TurnPhase> = {
-  "turn.start": "start",
-  "turn.eager_end": "eager_end",
-  "turn.resume": "resume",
-  "turn.end": "end",
-};
 
 /** One sentence handed to the speech model, and when its audio was sent. */
 type Segment = {
@@ -125,12 +115,6 @@ type ToolWaiter = {
   call: ToolCall;
   resolve: (result: { output: string; isError: boolean } | null) => void;
 };
-
-function rawDataToBuffer(data: RawData): Buffer {
-  if (Buffer.isBuffer(data)) return data;
-  if (Array.isArray(data)) return Buffer.concat(data);
-  return Buffer.from(data);
-}
 
 /** How much of a sentence had been played at `now`, cut at a word boundary. */
 function heardPart(segment: Segment, now: number): { text: string; whole: boolean } {
@@ -204,16 +188,10 @@ export function runConverseSession(
   config: Config,
   onClose: () => void,
 ): void {
-  let upstream: RealtimeConnection | null = null;
+  let upstream: Transcription | null = null;
   let params: ConverseStartParams | null = null;
   let llm: { name: string; provider: { baseUrl: string; apiKey: string }; model: string } | null = null;
-  let ready = false;
   let finished = false;
-
-  let pendingSends = 0;
-  let sendChain: Promise<void> = Promise.resolve();
-  const preReadyAudio: Buffer[] = [];
-  let preReadyBytes = 0;
   let idleTimer: NodeJS.Timeout | null = null;
   let sessionTimer: NodeJS.Timeout | null = null;
 
@@ -245,8 +223,7 @@ export function runConverseSession(
     for (const waiter of waiters.values()) waiter.resolve(null);
     waiters.clear();
     onClose();
-    const conn = upstream;
-    if (conn) void conn.close().catch(() => {});
+    upstream?.close();
     if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
       try {
         ws.close(code, reason);
@@ -691,10 +668,9 @@ export function runConverseSession(
         return;
       case "end": {
         turnOpen = false;
-        const conn = upstream;
         // Ask for the words still in the transcriber's buffer, then give
         // them a moment to arrive before answering.
-        if (conn) sendChain = sendChain.then(() => conn.flushAudio()).catch(() => {});
+        upstream?.flush();
         settleDeadline = Date.now() + config.converseSettleMs * 4;
         armSettle();
         return;
@@ -720,101 +696,23 @@ export function runConverseSession(
 
   // --- Transcription upstream ----------------------------------------------
 
-  const forwardAudio = (chunk: Buffer): void => {
-    const conn = upstream;
-    if (!conn || finished) return;
-    pendingSends += 1;
-    if (pendingSends > MAX_PENDING_SENDS) {
-      fail("backpressure", "Audio arrives faster than upstream accepts it", CLOSE_UPSTREAM_ERROR);
-      return;
-    }
-    sendChain = sendChain
-      .then(() => conn.sendAudio(chunk))
-      .catch((err) => {
-        if (!finished) fail("upstream_error", `Failed to forward audio: ${String(err)}`, CLOSE_UPSTREAM_ERROR);
-      })
-      .finally(() => {
-        pendingSends -= 1;
-      });
-  };
-
-  const pumpEvents = (conn: RealtimeConnection): void => {
-    void (async () => {
-      try {
-        for await (const event of conn.events()) {
-          if (finished) return;
-          if ("raw" in event) {
-            // The SDK doesn't model Voxtral 3 turn events yet; read them raw.
-            const phase = TURN_PHASES[event.type];
-            if (phase) onTurn(phase);
-            continue;
-          }
-          if (event.type === "transcription.text.delta") onTranscript(event.text);
-          else if (event.type === "error") {
-            const detail = event.error?.message;
-            fail(
-              "upstream_error",
-              typeof detail === "string" ? detail : JSON.stringify(detail ?? "Upstream error"),
-              CLOSE_UPSTREAM_ERROR,
-            );
-            return;
-          }
-        }
-        if (!finished) fail("upstream_error", "Transcription connection closed unexpectedly", CLOSE_UPSTREAM_ERROR);
-      } catch (err) {
-        if (!finished) fail("upstream_error", `Transcription stream failed: ${String(err)}`, CLOSE_UPSTREAM_ERROR);
-      }
-    })();
-  };
-
   const connectUpstream = (start: ConverseStartParams, llmName: string, llmModel: string): void => {
-    void (async () => {
-      let conn: RealtimeConnection;
-      try {
-        conn = await deps.realtime.connect(config.realtimeModel, { timeoutMs: CONNECT_TIMEOUT_MS });
-      } catch (err) {
-        fail("upstream_error", `Could not reach the transcription service: ${String(err)}`, CLOSE_UPSTREAM_ERROR);
-        return;
-      }
-      if (finished) {
-        void conn.close().catch(() => {});
-        return;
-      }
-      upstream = conn;
-      const turn = start.turnDetection;
-      try {
-        sendRawSessionUpdate(conn, {
-          audio_format: { encoding: "pcm_s16le", sample_rate: start.sampleRate },
-          target_streaming_delay_ms: start.targetDelayMs,
-          ...(start.language ? { language: start.language } : {}),
-          ...(start.contextBias ? { context_bias: start.contextBias } : {}),
-          turn_detection: {
-            start_threshold: turn.startThreshold,
-            eager_end_threshold: turn.eagerEndThreshold,
-            end_threshold: turn.endThreshold,
-            min_silence_ms: turn.minSilenceMs,
-            end_timeout_ms: turn.endTimeoutMs,
-          },
-        });
-      } catch (err) {
-        fail("server_error", String(err), CLOSE_INTERNAL);
-        return;
-      }
-      pumpEvents(conn);
-      ready = true;
-      send({
-        type: "ready",
-        requestId: conn.requestId,
-        sttModel: config.realtimeModel,
-        ttsModel: config.ttsModel,
-        llmProvider: llmName,
-        llmModel,
-        audio: { encoding: "pcm_s16le", sampleRate: TTS_SAMPLE_RATE, channels: 1 },
-      });
-      for (const chunk of preReadyAudio) forwardAudio(chunk);
-      preReadyAudio.length = 0;
-      preReadyBytes = 0;
-    })();
+    upstream = connectTranscription(deps.realtime, config.realtimeModel, toSessionUpdate(start), {
+      onReady: (requestId) =>
+        send({
+          type: "ready",
+          requestId,
+          sttModel: config.realtimeModel,
+          ttsModel: config.ttsModel,
+          llmProvider: llmName,
+          llmModel,
+          audio: { encoding: "pcm_s16le", sampleRate: TTS_SAMPLE_RATE, channels: 1 },
+        }),
+      onDelta: onTranscript,
+      onTurn: ({ phase }) => onTurn(phase),
+      onError: (code, message) =>
+        fail(code, message, code === "server_error" ? CLOSE_INTERNAL : CLOSE_UPSTREAM_ERROR),
+    });
   };
 
   // --- Client messages ------------------------------------------------------
@@ -828,17 +726,7 @@ export function runConverseSession(
         fail("bad_message", "Binary audio received before `start`", CLOSE_BAD_MESSAGE);
         return;
       }
-      const chunk = rawDataToBuffer(data);
-      if (ready) {
-        forwardAudio(chunk);
-        return;
-      }
-      preReadyBytes += chunk.length;
-      if (preReadyBytes > MAX_PREREADY_BUFFER_BYTES) {
-        fail("backpressure", "Too much audio buffered before the session was ready", CLOSE_UPSTREAM_ERROR);
-        return;
-      }
-      preReadyAudio.push(chunk);
+      upstream?.sendAudio(rawDataToBuffer(data));
       return;
     }
 

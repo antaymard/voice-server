@@ -498,7 +498,8 @@ can't run up a bill on your most expensive model.
 
 Speech in and out go through two small interfaces as well (`Tts` in
 `src/converse/tts.ts`, `Llm` in `src/converse/llm.ts`); the orchestration is
-in `src/converse/session.ts`.
+in `src/converse/session.ts`. Listening reuses the transcription connection of
+`/v1/realtime` (`src/realtime/upstream.ts`).
 
 ## Gladia realtime WebSocket — `GET /v1/gladia/realtime`
 
@@ -695,6 +696,6 @@ on :9098 with `GLADIA_API_KEY=any GLADIA_BASE_URL=http://127.0.0.1:9098`).
 - `@mistralai/mistralai` is pinned to exactly `3.3.0`: its realtime client
   only sets the audio format and doesn't model turn events, so the server
   sends the full `session.update` frame itself and reads `turn.*` events raw
-  (`src/mistral.ts`, `src/realtime/bridge.ts`). Revisit on SDK updates.
+  (`src/mistral.ts`, `src/realtime/upstream.ts`). Revisit on SDK updates.
 - The batch SSE streaming variant is not exposed (bulk responses return in one
   shot).
