@@ -519,6 +519,72 @@ test("an app event waits for the assistant to finish, unless it is urgent", asyn
   c.ws.close();
 });
 
+// --- The client's own brain: ears and mouth only -----------------------------
+
+test("client brain: the turn is handed to the client, and its text is spoken as it comes", async () => {
+  const c = await open({ brain: "client" });
+  assert.equal((await c.next("ready")).brain, "client");
+  c.turn("start");
+  c.say("crée un node budget");
+  c.turn("end");
+  assert.equal((await c.next("user_turn")).text, "crée un node budget");
+  await sleep(120);
+  assert.equal(llm.requests.length, 0); // no LLM runs here
+  assert.equal(c.events.some((e) => e.type === "response_start"), false);
+
+  // The client's agent answers, piece by piece.
+  c.sendJson({ type: "say", id: "msg_1", text: "Je crée le node. " });
+  const started = await c.next("response_start");
+  assert.equal(started.sayId, "msg_1");
+  c.sendJson({ type: "say", id: "msg_1", text: "C'est fait.", done: true });
+  const done = await c.next("response_done");
+  assert.deepEqual([done.sayId, done.text], ["msg_1", "Je crée le node. C'est fait."]);
+  assert.equal(Buffer.concat(c.audio).toString(), "MOCKAUDIMOCKAUDI"); // two sentences, spoken
+  assert.equal(llm.requests.length, 0);
+  c.ws.close();
+});
+
+test("client brain: talking over a reply cuts it, and the rest of that reply is dropped", async () => {
+  const c = await open({ brain: "client" });
+  await c.next("ready");
+  c.sendJson({ type: "say", id: "msg_1", text: "Voici une longue réponse. " });
+  await c.next("response_start");
+  while (c.audio.length === 0) await sleep(10);
+
+  c.turn("start");
+  c.say("non attends");
+  const cut = await c.next("interrupt");
+  assert.deepEqual([cut.sayId, cut.heardText], ["msg_1", "Voici une longue réponse."]);
+
+  // The agent is still writing that answer: none of it is spoken any more.
+  const audioAfterCut = c.audio.length;
+  c.sendJson({ type: "say", id: "msg_1", text: "Elle continue. ", done: true });
+  // And a reply does not start over the user either.
+  c.sendJson({ type: "say", id: "msg_2", text: "Autre chose. ", done: true });
+  await sleep(150);
+  assert.equal(c.audio.length, audioAfterCut);
+  assert.equal(c.events.filter((e) => e.type === "response_start").length, 1);
+
+  c.turn("end");
+  assert.equal((await c.next("user_turn")).text, "non attends");
+  // Once the user is done, the next reply is spoken normally.
+  c.sendJson({ type: "say", id: "msg_3", text: "D'accord.", done: true });
+  const done = await c.next("response_done");
+  assert.equal(done.sayId, "msg_3");
+  c.ws.close();
+});
+
+test("client brain: a new reply replaces the one still playing", async () => {
+  const c = await open({ brain: "client" });
+  await c.next("ready");
+  c.sendJson({ type: "say", id: "a", text: "Première réponse en cours. " });
+  await c.next("response_start");
+  c.sendJson({ type: "say", id: "b", text: "Seconde réponse.", done: true });
+  assert.equal((await c.next("interrupt")).sayId, "a");
+  assert.equal((await c.next("response_done")).sayId, "b");
+  c.ws.close();
+});
+
 test("the LLM is chosen per conversation, within what the server allows", async () => {
   const ok = await open({ provider: "other", model: "big-model" });
   assert.equal((await ok.next("ready")).llmProvider, "other");
