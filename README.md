@@ -580,7 +580,7 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 |---|---|---|---|
 | `MISTRAL_API_KEY` | yes | — | Mistral API key (server-side only) |
 | `AUTH_TOKEN` | yes | — | shared bearer token for your apps (use `openssl rand -hex 32`) |
-| `ALLOWED_ORIGINS` | yes | — | comma-separated origins; `*` disables the check (dev only) |
+| `ALLOWED_ORIGINS` | yes | — | comma-separated origins of your apps; `*` disables the check (dev only). The server's own demo pages are always allowed |
 | `PORT` | no | `3000` | injected by Railway |
 | `BATCH_MODEL` | no | `voxtral-mini-transcribe-3-0` | bulk transcription model (`voxtral-small-transcribe-3-0` = higher quality) |
 | `REALTIME_MODEL` | no | `voxtral-mini-transcribe-realtime-3-0` | realtime model |
