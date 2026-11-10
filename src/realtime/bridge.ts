@@ -1,9 +1,5 @@
 import type WebSocket from "ws";
-import type { RawData } from "ws";
-import type {
-  RealtimeConnection,
-  RealtimeTranscription,
-} from "@mistralai/mistralai/extra/realtime";
+import type { RealtimeTranscription } from "@mistralai/mistralai/extra/realtime";
 import {
   CLOSE_BAD_MESSAGE,
   CLOSE_DONE,
@@ -16,25 +12,18 @@ import {
   type ServerErrorCode,
   type ServerEvent,
   type StartParams,
-  type TurnPhase,
 } from "../../client/src/protocol.ts";
 import type { Config } from "../config.ts";
-import { sendRawSessionUpdate, type RawSessionUpdate } from "../mistral.ts";
+import type { RawSessionUpdate } from "../mistral.ts";
+import { connectTranscription, rawDataToBuffer, type Transcription } from "./upstream.ts";
 
-const CONNECT_TIMEOUT_MS = 10_000;
 const DONE_GRACE_MS = 10_000;
-const MAX_PENDING_SENDS = 200; // ~20s of audio at 100ms frames
-const MAX_PREREADY_BUFFER_BYTES = 512 * 1024; // ~16s @ 16kHz s16le
 const MAX_CLIENT_BUFFERED_BYTES = 5 * 1024 * 1024;
 
-const TURN_PHASES: Record<string, TurnPhase> = {
-  "turn.start": "start",
-  "turn.eager_end": "eager_end",
-  "turn.resume": "resume",
-  "turn.end": "end",
-};
-
-function toSessionUpdate(params: StartParams): RawSessionUpdate {
+export function toSessionUpdate(
+  params: Pick<StartParams, "sampleRate" | "targetDelayMs" | "language" | "contextBias" | "turnDetection"> &
+    Partial<Pick<StartParams, "diarize" | "speakerReferences">>,
+): RawSessionUpdate {
   const turn = params.turnDetection;
   return {
     audio_format: { encoding: "pcm_s16le", sample_rate: params.sampleRate },
@@ -57,12 +46,6 @@ function toSessionUpdate(params: StartParams): RawSessionUpdate {
   };
 }
 
-function rawDataToBuffer(data: RawData): Buffer {
-  if (Buffer.isBuffer(data)) return data;
-  if (Array.isArray(data)) return Buffer.concat(data);
-  return Buffer.from(data);
-}
-
 /**
  * Bridge one browser WebSocket to one Mistral realtime connection.
  * Cleanup is idempotent and runs whichever side dies first.
@@ -73,18 +56,12 @@ export function runSession(
   config: Config,
   onClose: () => void,
 ): void {
-  let upstream: RealtimeConnection | null = null;
+  let upstream: Transcription | null = null;
   let started = false;
   let ready = false;
   let stopping = false;
-  let stopPending = false;
   let finished = false;
   let closeAfterDoneReason = "done";
-
-  let pendingSends = 0;
-  let sendChain: Promise<void> = Promise.resolve();
-  const preReadyAudio: Buffer[] = [];
-  let preReadyBytes = 0;
 
   let idleTimer: NodeJS.Timeout | null = null;
   let sessionTimer: NodeJS.Timeout | null = null;
@@ -100,8 +77,7 @@ export function runSession(
     finished = true;
     clearTimers();
     onClose();
-    const conn = upstream;
-    if (conn) void conn.close().catch(() => {});
+    upstream?.close();
     if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
       try {
         ws.close(code, reason);
@@ -138,29 +114,8 @@ export function runSession(
     );
   };
 
-  const forwardAudio = (chunk: Buffer): void => {
-    const conn = upstream;
-    if (!conn || finished || stopping) return;
-    pendingSends += 1;
-    if (pendingSends > MAX_PENDING_SENDS) {
-      fail("backpressure", "Audio arrives faster than upstream accepts it", CLOSE_UPSTREAM_ERROR);
-      return;
-    }
-    sendChain = sendChain
-      .then(() => conn.sendAudio(chunk))
-      .catch((err) => {
-        if (!finished && !stopping) {
-          fail("upstream_error", `Failed to forward audio: ${String(err)}`, CLOSE_UPSTREAM_ERROR);
-        }
-      })
-      .finally(() => {
-        pendingSends -= 1;
-      });
-  };
-
-  const executeStop = (): void => {
-    const conn = upstream;
-    if (!conn || finished) return;
+  /** The final transcript is due: don't wait for it forever. */
+  const armDoneTimer = (): void => {
     const maxDuration = closeAfterDoneReason === "max_duration";
     doneTimer = setTimeout(
       () =>
@@ -171,14 +126,6 @@ export function runSession(
         ),
       DONE_GRACE_MS,
     );
-    sendChain = sendChain
-      .then(async () => {
-        await conn.flushAudio();
-        await conn.endAudio();
-      })
-      .catch((err) => {
-        if (!finished) fail("upstream_error", `Failed to finalize: ${String(err)}`, CLOSE_UPSTREAM_ERROR);
-      });
   };
 
   const beginStop = (reason: string): void => {
@@ -189,133 +136,36 @@ export function runSession(
       clearTimeout(idleTimer);
       idleTimer = null;
     }
-    if (!upstream || !ready) {
-      stopPending = true;
-      return;
-    }
-    executeStop();
-  };
-
-  const pumpEvents = (conn: RealtimeConnection): void => {
-    void (async () => {
-      try {
-        for await (const event of conn.events()) {
-          if (finished) break;
-          if ("raw" in event) {
-            // The SDK doesn't model Voxtral 3 turn events yet; read them raw.
-            const phase = TURN_PHASES[event.type];
-            const raw = event.raw as { time_s?: unknown; end_reason?: unknown } | null;
-            if (phase && raw && typeof raw.time_s === "number") {
-              const endReason = raw.end_reason;
-              send({
-                type: "turn",
-                phase,
-                time: raw.time_s,
-                ...(endReason === "threshold" || endReason === "timeout" ? { endReason } : {}),
-              });
-            }
-            continue; // other unparseable/unknown upstream events are dropped
-          }
-          switch (event.type) {
-            case "session.created":
-            case "session.updated":
-              break;
-            case "transcription.text.delta":
-              send({ type: "delta", text: event.text });
-              break;
-            case "transcription.segment":
-              send({
-                type: "segment",
-                text: event.text,
-                start: event.start,
-                end: event.end,
-                speakerId: event.speakerId ?? null,
-              });
-              break;
-            case "transcription.language":
-              send({ type: "language", language: event.audioLanguage });
-              break;
-            case "transcription.done":
-              send({
-                type: "done",
-                text: event.text,
-                language: event.language ?? null,
-                segments: (event.segments ?? []).map((s) => ({
-                  text: s.text,
-                  start: s.start,
-                  end: s.end,
-                  speakerId: s.speakerId ?? null,
-                })),
-                usage: event.usage,
-              });
-              finish(CLOSE_DONE, closeAfterDoneReason);
-              return;
-            case "error": {
-              const detail = event.error;
-              const message =
-                typeof detail?.message === "string"
-                  ? detail.message
-                  : JSON.stringify(detail?.message ?? "Upstream error");
-              fail("upstream_error", message, CLOSE_UPSTREAM_ERROR);
-              return;
-            }
-          }
-        }
-        if (!finished) {
-          fail("upstream_error", "Upstream connection closed unexpectedly", CLOSE_UPSTREAM_ERROR);
-        }
-      } catch (err) {
-        if (!finished) {
-          fail("upstream_error", `Upstream stream failed: ${String(err)}`, CLOSE_UPSTREAM_ERROR);
-        }
-      }
-    })();
+    upstream?.end();
   };
 
   const connectUpstream = (params: StartParams): void => {
-    void (async () => {
-      let conn: RealtimeConnection;
-      try {
-        conn = await realtime.connect(config.realtimeModel, { timeoutMs: CONNECT_TIMEOUT_MS });
-      } catch (err) {
-        fail(
-          "upstream_error",
-          `Could not reach the transcription service: ${String(err)}`,
-          CLOSE_UPSTREAM_ERROR,
-        );
-        return;
-      }
-      if (finished) {
-        void conn.close().catch(() => {});
-        return;
-      }
-      upstream = conn;
-      try {
-        // WS messages are processed in order upstream, so audio sent after
-        // this update is transcribed with the requested settings (which lock
-        // on the first audio chunk).
-        sendRawSessionUpdate(conn, toSessionUpdate(params));
-      } catch (err) {
-        fail("server_error", String(err), CLOSE_INTERNAL);
-        return;
-      }
-      pumpEvents(conn);
-      ready = true;
-      send({
-        type: "ready",
-        requestId: conn.requestId,
-        model: config.realtimeModel,
-        sampleRate: params.sampleRate,
-        targetDelayMs: params.targetDelayMs,
-        language: params.language ?? null,
-        diarize: params.diarize,
-        turnDetection: params.turnDetection !== undefined,
-      });
-      for (const chunk of preReadyAudio) forwardAudio(chunk);
-      preReadyAudio.length = 0;
-      preReadyBytes = 0;
-      if (stopPending) executeStop();
-    })();
+    upstream = connectTranscription(realtime, config.realtimeModel, toSessionUpdate(params), {
+      onReady: (requestId) => {
+        ready = true;
+        send({
+          type: "ready",
+          requestId,
+          model: config.realtimeModel,
+          sampleRate: params.sampleRate,
+          targetDelayMs: params.targetDelayMs,
+          language: params.language ?? null,
+          diarize: params.diarize,
+          turnDetection: params.turnDetection !== undefined,
+        });
+      },
+      onDelta: (text) => send({ type: "delta", text }),
+      onSegment: (segment) => send({ type: "segment", ...segment }),
+      onLanguage: (language) => send({ type: "language", language }),
+      onTurn: (turn) => send({ type: "turn", ...turn }),
+      onEnding: armDoneTimer,
+      onDone: (done) => {
+        send({ type: "done", ...done });
+        finish(CLOSE_DONE, closeAfterDoneReason);
+      },
+      onError: (code, message) =>
+        fail(code, message, code === "server_error" ? CLOSE_INTERNAL : CLOSE_UPSTREAM_ERROR),
+    });
   };
 
   ws.on("message", (data, isBinary) => {
@@ -327,18 +177,7 @@ export function runSession(
         fail("bad_message", "Binary audio received before `start`", CLOSE_BAD_MESSAGE);
         return;
       }
-      if (stopping) return;
-      const chunk = rawDataToBuffer(data);
-      if (!ready) {
-        preReadyBytes += chunk.length;
-        if (preReadyBytes > MAX_PREREADY_BUFFER_BYTES) {
-          fail("backpressure", "Too much audio buffered before the session was ready", CLOSE_UPSTREAM_ERROR);
-          return;
-        }
-        preReadyAudio.push(chunk);
-        return;
-      }
-      forwardAudio(chunk);
+      upstream?.sendAudio(rawDataToBuffer(data));
       return;
     }
 
@@ -367,10 +206,7 @@ export function runSession(
           fail("bad_message", "`flush` before `start`", CLOSE_BAD_MESSAGE);
           return;
         }
-        const conn = upstream;
-        if (conn && ready && !stopping) {
-          sendChain = sendChain.then(() => conn.flushAudio()).catch(() => {});
-        }
+        upstream?.flush();
         return;
       }
       case "stop": {

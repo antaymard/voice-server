@@ -7,6 +7,8 @@ import { createGladiaClient } from "./gladia/client.ts";
 import { createMediaJobs } from "./media/jobs.ts";
 import { createMistralClients } from "./mistral.ts";
 import { attachRealtime, type RealtimeControl } from "./realtime/server.ts";
+import { openAiCompatibleLlm } from "./converse/llm.ts";
+import { createVoxtralTts } from "./converse/tts.ts";
 
 export type RunningServer = {
   port: number;
@@ -37,7 +39,15 @@ export function startServer(config: Config): Promise<RunningServer> {
           }),
       });
     }) as HttpServer;
-    control = attachRealtime(server, { realtime, gladia }, config);
+    control = attachRealtime(
+      server,
+      {
+        realtime,
+        gladia,
+        converse: { realtime, llm: openAiCompatibleLlm, tts: createVoxtralTts(batch, config) },
+      },
+      config,
+    );
   });
 }
 

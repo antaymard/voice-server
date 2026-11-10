@@ -8,6 +8,7 @@ import type { Config } from "../config.ts";
 import type { GladiaClient } from "../gladia/client.ts";
 import { runGladiaSession } from "../gladia/bridge.ts";
 import { runSession } from "./bridge.ts";
+import { runConverseSession, type ConverseDeps } from "../converse/session.ts";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 
@@ -39,6 +40,8 @@ export type RealtimeDeps = {
   realtime: RealtimeTranscription;
   /** null when GLADIA_API_KEY is not configured (upgrades answer 503). */
   gladia: GladiaClient | null;
+  /** Live voice conversations (/v1/converse). */
+  converse: ConverseDeps;
 };
 
 export function attachRealtime(
@@ -66,7 +69,7 @@ export function attachRealtime(
       rejectUpgrade(socket, 400, `unparseable request URL "${req.url ?? ""}"`);
       return;
     }
-    if (pathname !== "/v1/realtime" && pathname !== "/v1/gladia/realtime") {
+    if (pathname !== "/v1/realtime" && pathname !== "/v1/gladia/realtime" && pathname !== "/v1/converse") {
       rejectUpgrade(socket, 404, `unknown path "${pathname}"`);
       return;
     }
@@ -97,6 +100,8 @@ export function attachRealtime(
       const onClose = (): void => void sessions.delete(ws);
       if (pathname === "/v1/gladia/realtime") {
         runGladiaSession(ws, deps.gladia as GladiaClient, config, onClose);
+      } else if (pathname === "/v1/converse") {
+        runConverseSession(ws, deps.converse, config, onClose);
       } else {
         runSession(ws, deps.realtime, config, onClose);
       }
