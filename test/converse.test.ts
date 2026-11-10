@@ -486,3 +486,19 @@ test("raw pcm is recognized as 16-bit or float and always leaves as 16-bit", () 
   assert.equal(intFormat.encoding, "s16le");
   assert.deepEqual(Buffer.concat(kept.filter((b): b is Buffer => b !== null)), asInt);
 });
+
+test("an OpenRouter key alone selects OpenRouter; LLM_MODEL still decides when set", () => {
+  const base = { MISTRAL_API_KEY: "m", AUTH_TOKEN: "x".repeat(32), ALLOWED_ORIGINS: "*", OPENROUTER_API_KEY: "or-key" };
+  const auto = loadConfig(base);
+  assert.deepEqual(auto.llmProviders["openrouter"], { baseUrl: "https://openrouter.ai/api/v1", apiKey: "or-key" });
+  assert.deepEqual([auto.llmDefaultProvider, auto.llmModel], ["openrouter", "anthropic/claude-haiku-5.5"]);
+
+  const pinned = loadConfig({ ...base, LLM_MODEL: "openrouter:openai/gpt-x" });
+  assert.deepEqual([pinned.llmDefaultProvider, pinned.llmModel], ["openrouter", "openai/gpt-x"]);
+
+  const mistral = loadConfig({ ...base, LLM_MODEL: "mistral-large-latest" });
+  assert.deepEqual([mistral.llmDefaultProvider, mistral.llmModel], ["default", "mistral-large-latest"]);
+
+  const none = loadConfig({ ...base, OPENROUTER_API_KEY: undefined });
+  assert.deepEqual([none.llmDefaultProvider, none.llmModel], ["default", "mistral-small-latest"]);
+});

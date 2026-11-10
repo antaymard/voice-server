@@ -24,6 +24,7 @@ export function makeConfig(overrides: Partial<Config> = {}): Config {
     mistralBaseUrl: "http://127.0.0.1:1",
     mistralWsUrl: "ws://127.0.0.1:1",
     llmProviders: { default: { baseUrl: "http://127.0.0.1:1/v1", apiKey: "mock-llm-key" } },
+    llmDefaultProvider: "default",
     llmModel: "mock-llm",
     llmAllowedModels: [],
     converseTts: "realtime",

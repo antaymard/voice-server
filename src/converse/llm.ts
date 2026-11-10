@@ -35,14 +35,14 @@ export function resolveLlm(
   config: Config,
   requested: { provider?: string; model?: string },
 ): { name: string; provider: LlmProvider; model: string } | { error: string } {
-  const name = (requested.provider ?? "default").toLowerCase();
+  const name = (requested.provider ?? config.llmDefaultProvider).toLowerCase();
   const provider = config.llmProviders[name];
   if (!provider) {
     return { error: `Unknown LLM provider "${name}" (configured: ${Object.keys(config.llmProviders).join(", ")})` };
   }
-  const model = requested.model ?? (name === "default" ? config.llmModel : undefined);
+  const model = requested.model ?? (name === config.llmDefaultProvider ? config.llmModel : undefined);
   if (!model) return { error: `Provider "${name}" needs an explicit \`model\`` };
-  const isDefault = name === "default" && model === config.llmModel;
+  const isDefault = name === config.llmDefaultProvider && model === config.llmModel;
   const allowed =
     isDefault ||
     config.llmAllowedModels === "*" ||
