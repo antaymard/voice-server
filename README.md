@@ -377,7 +377,9 @@ Client → server:
    `error` (`bad_message`) and close `4400`, before anything is sent upstream.
 2. Binary frames: raw **PCM s16le mono** at the declared rate (~100 ms per
    frame recommended; max 1 MiB per frame).
-3. `{"type":"flush"}` (optional): force early processing of buffered audio.
+3. `{"type":"flush"}` (optional): transcribe what is buffered now. On
+   Voxtral 3 this **finalizes the session** (a `done` event follows and the
+   socket closes), like `stop`.
 4. `{"type":"stop"}`: finalize — remaining deltas and `done` follow, then the
    socket closes normally.
 

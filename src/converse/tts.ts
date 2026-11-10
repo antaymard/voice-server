@@ -9,6 +9,12 @@ import { CompleteAcceptEnum } from "@mistralai/mistralai/sdk/speech.js";
 import type { Config } from "../config.ts";
 import { createSentenceSplitter, toSpeakable } from "./sentences.ts";
 
+/**
+ * Mistral's speech request refuses to run without a voice; this is the one
+ * its realtime speech session uses when none is given.
+ */
+const DEFAULT_VOICE = "voice_447";
+
 /** Format of the audio every `Tts` yields: headerless PCM s16le mono. */
 export const TTS_SAMPLE_RATE = 24000;
 export const TTS_BYTES_PER_SECOND = TTS_SAMPLE_RATE * 2;
@@ -77,8 +83,9 @@ class AsyncQueue<T> implements AsyncIterable<T> {
 
 /**
  * Mistral documents `pcm` output as mono 24 kHz without stating the sample
- * type, so it is detected from the data (16-bit integers read as floats are
- * almost never plausible samples) and remembered. Everything leaves as s16le.
+ * type (observed: 32-bit float), so it is detected from the data (16-bit
+ * integers read as floats are almost never plausible samples) and
+ * remembered. Everything leaves as s16le.
  */
 export type PcmFormat = { encoding: "auto" | "s16le" | "f32le" };
 
@@ -145,7 +152,7 @@ export function createHttpTts(batch: Mistral, config: Config, format: PcmFormat)
   return ({ voice, signal }) => {
     const splitter = createSentenceSplitter();
     const sentences = new AsyncQueue<string>();
-    const voiceId = voice || config.ttsVoice;
+    const voiceId = voice || config.ttsVoice || DEFAULT_VOICE;
     signal.addEventListener("abort", () => sentences.close());
 
     async function* items(): AsyncGenerator<TtsItem> {
@@ -162,7 +169,7 @@ export function createHttpTts(batch: Mistral, config: Config, format: PcmFormat)
               input: speakable,
               responseFormat: "pcm",
               stream: true,
-              ...(voiceId ? { voiceId } : {}),
+              voiceId,
             },
             { acceptHeaderOverride: CompleteAcceptEnum.textEventStream, signal },
           );

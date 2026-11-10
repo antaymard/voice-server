@@ -89,7 +89,10 @@ export type StartMessage = {
   turnDetection?: boolean | TurnDetectionOptions;
 };
 
-/** Ask the transcriber to process buffered audio without waiting. */
+/**
+ * Ask the transcriber to process buffered audio without waiting. On Voxtral 3
+ * this finalizes the session: `done` follows and the socket closes.
+ */
 export type FlushMessage = { type: "flush" };
 
 /** End the session gracefully: remaining deltas and a `done` event follow. */
