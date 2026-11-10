@@ -422,9 +422,13 @@ What the server does for you:
 - **Thinks ahead.** On `eager_end` (the user has probably finished) the reply
   starts being prepared, but nothing is sent until `end` confirms the turn;
   if the user resumes, the work is thrown away.
-- **Acts while the user speaks.** Tools declared `speculative` (read-only)
-  are called during that early phase; tools with side effects wait for the
-  turn to be final.
+- **Acts while the user speaks.** In the middle of a sentence, the model is
+  shown what has been said so far (at each clause, or every ten words) and
+  may already call the tools you declared `immediate` — "turn the page red,
+  and then…": the page is red before the sentence ends. Tools declared
+  `speculative` (read-only) can also run then, and during the "probably
+  finished" phase. Everything else waits for the turn to be final. What was
+  done early is handed to the reply, so nothing runs twice.
 - **Can be interrupted — without headphones.** When the user speaks over the
   assistant, generation and speech stop, and the model's memory keeps only
   what was actually heard. A turn that starts while the assistant is audible
@@ -447,7 +451,8 @@ What the server does for you:
    |---|---|---|
    | `sampleRate`, `targetDelayMs`, `language`, `contextBias`, `turnDetection` | as `/v1/realtime` | transcription settings (turn detection is always on) |
    | `instructions` | — | system prompt (the server adds "you are speaking: no markdown, be brief") |
-   | `tools` | `[]` | `[{ name, description?, parameters? (JSON Schema), speculative? }]`, max 32 |
+   | `tools` | `[]` | `[{ name, description?, parameters? (JSON Schema), speculative?, immediate? }]`, max 32. `speculative`: read-only, may run before the turn is final and be cancelled. `immediate`: has effects, may run mid-sentence and is never undone — keep it for actions that are cheap to correct |
+   | `actEarly` | `true` | consult the model mid-sentence (extra LLM calls: a few per long sentence; none without `immediate`/`speculative` tools) |
    | `history` | `[]` | `[{ role: "user" \| "assistant", content }]` to resume a conversation |
    | `provider`, `model` | server default | which LLM to use; must be allowed by the server (see below) |
    | `voice` | `TTS_VOICE` | voice id for the replies |
@@ -471,7 +476,7 @@ assistant's speech** (PCM s16le mono 24 kHz, see `ready.audio`):
 | `user_turn` | `text` | the finished turn, as given to the model |
 | `response_start` | `responseId` | binary frames that follow belong to this response |
 | `assistant_delta` | `responseId, text` | reply text (arrives ahead of its audio) |
-| `tool_call` | `responseId, callId, name, arguments, speculative` | run it, answer with `tool_result`. `arguments` is a JSON string written by the model: validate it |
+| `tool_call` | `responseId, callId, name, arguments, speculative, early` | run it, answer with `tool_result`. `arguments` is a JSON string written by the model: validate it. `early`: decided mid-sentence (`responseId` is then `null`) |
 | `tool_cancel` | `callId` | a speculative call is no longer needed |
 | `response_done` | `responseId, text` | the reply is complete |
 | `interrupt` | `responseId, heardText` | **stop playback and drop queued audio** |

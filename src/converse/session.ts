@@ -13,6 +13,10 @@
  *   A turn that starts while the assistant is audible only counts once it
  *   carries words that are not the assistant's own (echo from the speakers,
  *   a cough or a door slam don't cut it off).
+ * - Acting mid-sentence: while the user is still speaking, the model is
+ *   shown what they have said so far and may already call the tools declared
+ *   `immediate` (or `speculative`). What it did is handed to the reply that
+ *   follows, so nothing is done twice.
  * - Tools don't block the conversation: a call that outlives its response
  *   (timeout or interruption) keeps running client-side, and its result is
  *   picked up when it arrives.
@@ -66,6 +70,18 @@ const VOICE_PREAMBLE =
   "contain transcription errors. If you were interrupted, your previous message only holds what the " +
   "user actually heard. A tool result marked as pending is still running: say so briefly and carry on; " +
   "its result will be given to you when it arrives.";
+
+const LISTENING_PREAMBLE =
+  "LISTENING MODE. The user is still speaking: their last message is unfinished and may stop " +
+  "mid-sentence. Do not reply to them and do not ask anything. If a part of what they have said " +
+  "so far is complete and unambiguous, and can be carried out with the available tools, call " +
+  "those tools now; do not repeat a call already made. If nothing can be done yet, output nothing.";
+
+/** A look at the unfinished sentence needs this many new words… */
+const EARLY_MIN_NEW_WORDS = 4;
+/** …and a clause boundary, or this many words without one. */
+const EARLY_MAX_NEW_WORDS = 10;
+const CLAUSE_BOUNDARY = /[,;:.!?…]/;
 
 const PENDING_TOOL_OUTPUT = JSON.stringify({
   status: "pending",
@@ -216,6 +232,12 @@ export function runConverseSession(
   const lateCalls = new Map<string, string>();
   /** Results of such calls, waiting to be shown to the model on its next turn. */
   let lateResults: string[] = [];
+  /** Tool calls made while the user was still speaking, for the turn in progress. */
+  let turnActions: { call: ToolCall; result: string | null }[] = [];
+  /** The look at the unfinished sentence that is under way, if any. */
+  let earlyPass: AbortController | null = null;
+  /** Words of the turn the model has already looked at. */
+  let wordsSeenEarly = 0;
 
   const finish = (code: number, reason: string): void => {
     if (finished) return;
@@ -289,8 +311,35 @@ export function runConverseSession(
   const openTurn = (userText: string | null): void => {
     for (const content of lateResults) history.push({ role: "user", content });
     lateResults = [];
-    if (userText) history.push({ role: "user", content: userText });
+    if (userText) {
+      history.push({ role: "user", content: userText });
+      // What was already done mid-sentence follows the user's words, as if
+      // the assistant had answered them with those calls.
+      history.push(...takeTurnActions());
+    }
     trimHistory();
+  };
+
+  const actionMessages = (): ChatMessage[] =>
+    turnActions.length === 0
+      ? []
+      : [
+          { role: "assistant", content: null, tool_calls: turnActions.map((a) => a.call) },
+          ...turnActions.map((a) => toolMessage(a.call, a.result ?? PENDING_TOOL_OUTPUT)),
+        ];
+
+  /** The turn is final: its early actions leave the "in progress" state. */
+  const takeTurnActions = (): ChatMessage[] => {
+    earlyPass?.abort();
+    earlyPass = null;
+    wordsSeenEarly = 0;
+    const messages = actionMessages();
+    // Still running: their results will come in as late results.
+    for (const action of turnActions) {
+      if (action.result === null) lateCalls.set(action.call.id, action.call.function.name);
+    }
+    turnActions = [];
+    return messages;
   };
 
   const trimHistory = (): void => {
@@ -307,6 +356,7 @@ export function runConverseSession(
       : [
           ...lateResults.map((content) => ({ role: "user" as const, content })),
           ...(response.userText ? [{ role: "user" as const, content: response.userText }] : []),
+          ...(response.userText ? actionMessages() : []),
           ...response.buffered,
         ];
     return [{ role: "system", content: systemPrompt }, ...mergeUserMessages([...history, ...pending])];
@@ -379,6 +429,7 @@ export function runConverseSession(
       name: call.function.name,
       arguments: call.function.arguments,
       speculative: !response.committed,
+      early: false,
     });
     let timer: NodeJS.Timeout | null = null;
     const result = await new Promise<{ output: string; isError: boolean } | null>((resolve) => {
@@ -524,6 +575,9 @@ export function runConverseSession(
 
   const startResponse = (userText: string | null, committed: boolean): void => {
     stopCurrent();
+    // From here the reply handles the request: no second opinion in parallel.
+    earlyPass?.abort();
+    earlyPass = null;
     const response: ResponseState = {
       id: randomUUID(),
       abort: new AbortController(),
@@ -600,7 +654,77 @@ export function runConverseSession(
     suspect = false;
     heldEvents = [];
     userBuffer = "";
+    wordsSeenEarly = 0;
   };
+
+  /** Tools the model may use before the user has finished speaking. */
+  const earlyTools = (): ConverseStartParams["tools"] =>
+    params?.actEarly ? params.tools.filter((t) => t.immediate || t.speculative) : [];
+
+  /** Show the model the unfinished sentence, in case it can already act on it. */
+  const lookEarly = async (): Promise<void> => {
+    const active = llm;
+    const tools = earlyTools();
+    if (!active) return;
+    const controller = new AbortController();
+    earlyPass = controller;
+    const text = userBuffer.trim();
+    wordsSeenEarly = wordsOf(text).length;
+    try {
+      const calls: ToolCall[] = [];
+      const stream = deps.llm({
+        provider: active.provider,
+        model: active.model,
+        messages: [
+          { role: "system", content: `${systemPrompt}\n\n${LISTENING_PREAMBLE}` },
+          ...mergeUserMessages([
+            ...history,
+            ...lateResults.map((content) => ({ role: "user" as const, content })),
+            { role: "user", content: text },
+          ]),
+          ...actionMessages(),
+        ],
+        tools: tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
+        signal: controller.signal,
+      });
+      for await (const chunk of stream) {
+        if (chunk.type === "tool_call") calls.push(chunk.call); // any text is ignored: it must not talk
+      }
+      if (controller.signal.aborted || finished) return;
+      for (const call of calls) {
+        const known = tools.some((t) => t.name === call.function.name);
+        const repeated = turnActions.some(
+          (a) => a.call.function.name === call.function.name && a.call.function.arguments === call.function.arguments,
+        );
+        if (!known || repeated) continue;
+        turnActions.push({ call, result: null });
+        send({
+          type: "tool_call",
+          responseId: null,
+          callId: call.id,
+          name: call.function.name,
+          arguments: call.function.arguments,
+          speculative: true,
+          early: true,
+        });
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) console.warn("[converse] early look failed:", err);
+    } finally {
+      if (earlyPass === controller) {
+        earlyPass = null;
+        considerEarlyLook(""); // words kept coming meanwhile
+      }
+    }
+  };
+
+  function considerEarlyLook(delta: string): void {
+    if (finished || suspect || current || earlyPass || earlyTools().length === 0) return;
+    const fresh = wordsOf(userBuffer).length - wordsSeenEarly;
+    if (fresh >= EARLY_MAX_NEW_WORDS || (fresh >= EARLY_MIN_NEW_WORDS && CLAUSE_BOUNDARY.test(delta))) {
+      void lookEarly();
+    }
+  }
 
   const reviewSuspect = (): void => {
     if (suspect && classifyEcho(userBuffer, audible?.text ?? "") === "speech") confirmTurn();
@@ -643,6 +767,7 @@ export function runConverseSession(
       discardSpeculative(current);
       if (userBuffer.trim()) startResponse(userBuffer.trim(), false);
     }
+    considerEarlyLook(text);
   };
 
   const onTurn = (phase: TurnPhase): void => {
@@ -687,6 +812,11 @@ export function runConverseSession(
     const waiter = waiters.get(callId);
     if (waiter) {
       waiter.resolve({ output, isError });
+      return;
+    }
+    const action = turnActions.find((a) => a.call.id === callId);
+    if (action) {
+      action.result = (isError ? "Error: " : "") + output;
       return;
     }
     const name = lateCalls.get(callId);

@@ -23,6 +23,7 @@ const TOOLS = [
   {
     name: "set_accent_color",
     description: "Change the accent color of the page.",
+    immediate: true, // harmless to redo: may run while the user is still mid-sentence
     parameters: {
       type: "object",
       properties: { color: { type: "string", description: "A CSS color, e.g. #e5534b or teal" } },
@@ -121,7 +122,8 @@ function cleanup() {
 
 async function runTool(ws, ev) {
   const tool = TOOLS.find((t) => t.name === ev.name);
-  const line = bubble("tool", `${ev.speculative ? "(early) " : ""}${ev.name}(${ev.arguments})`);
+  const when = ev.early ? "(mid-sentence) " : ev.speculative ? "(before you finished) " : "";
+  const line = bubble("tool", `${when}${ev.name}(${ev.arguments})`);
   let output;
   let isError = false;
   try {

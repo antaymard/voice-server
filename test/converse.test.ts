@@ -250,6 +250,59 @@ test("speculative tools run before the turn is final and can be cancelled; other
   c.ws.close();
 });
 
+test("it acts in the middle of the user's sentence, and the reply knows what was done", async () => {
+  const tools = [{ name: "set_color", immediate: true }, { name: "send_email" }];
+  llm.script(
+    { toolCalls: [{ id: "early_1", name: "set_color", arguments: '{"color":"red"}' }] },
+    { text: ["C'est rouge, et bonjour !"] },
+  );
+  const c = await open({ tools });
+  await c.next("ready");
+  c.turn("start");
+  c.say("mets la page en rouge");
+  await sleep(60);
+  assert.equal(llm.requests.length, 0); // no clause boundary yet: the model is not bothered
+  c.say(",");
+
+  const call = await c.next("tool_call");
+  assert.deepEqual(
+    { name: call.name, early: call.early, responseId: call.responseId },
+    { name: "set_color", early: true, responseId: null },
+  );
+  assert.equal(c.events.some((e) => e.type === "user_turn"), false); // still mid-sentence
+  const early = llm.requests[0]?.body as { messages: Array<Record<string, unknown>>; tools: Array<{ function: { name: string } }> };
+  assert.match(String(early.messages[0]?.["content"]), /LISTENING MODE/);
+  assert.deepEqual(early.messages.at(-1), { role: "user", content: "mets la page en rouge," });
+  assert.deepEqual(early.tools.map((t) => t.function.name), ["set_color"]); // send_email must wait
+  c.sendJson({ type: "tool_result", callId: call.callId, output: '{"ok":true}' });
+
+  c.say(" et dis bonjour");
+  c.turn("end");
+  assert.equal((await c.next("response_done")).text, "C'est rouge, et bonjour !");
+  assert.equal(c.events.filter((e) => e.type === "tool_call").length, 1);
+  const final = messagesOf(llm.requests.length - 1);
+  assert.doesNotMatch(String(final[0]?.["content"]), /LISTENING MODE/);
+  assert.deepEqual(final[1], { role: "user", content: "mets la page en rouge, et dis bonjour" });
+  assert.equal((final[2]?.["tool_calls"] as Array<{ id: string }>)[0]?.id, "early_1");
+  assert.deepEqual(final[3], { role: "tool", tool_call_id: "early_1", name: "set_color", content: '{"ok":true}' });
+  c.ws.close();
+});
+
+test("without tools allowed to run early, the model is only consulted once the user is done", async () => {
+  llm.script({ text: ["D'accord."] });
+  const c = await open({ tools: [{ name: "send_email" }] });
+  await c.next("ready");
+  c.turn("start");
+  c.say("écris à Paul pour lui dire que,");
+  c.say(" finalement, je viens demain matin avec les documents signés");
+  await sleep(80);
+  assert.equal(llm.requests.length, 0);
+  c.turn("end");
+  await c.next("response_done");
+  assert.equal(llm.requests.length, 1);
+  c.ws.close();
+});
+
 test("barge-in cuts the reply and the model remembers only what was heard", async () => {
   llm.script({ text: ["Première phrase. ", "Deuxième phrase jamais"], hangMs: 2000 }, { text: ["D'accord."] });
   const c = await open();

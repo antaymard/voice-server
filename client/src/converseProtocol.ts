@@ -41,6 +41,14 @@ export type ToolDefinition = {
    * only sent once the turn is final.
    */
   speculative?: boolean;
+  /**
+   * May run while the user is still in the middle of their sentence, as soon
+   * as that part of the request is clear ("turn the page red, and then…" —
+   * the page turns red while they go on). Unlike `speculative`, this is for
+   * tools with visible effects, and nothing undoes them if the user changes
+   * their mind: keep it for actions that are cheap to correct. Default false.
+   */
+  immediate?: boolean;
 };
 
 export type HistoryMessage = { role: "user" | "assistant"; content: string };
@@ -79,6 +87,12 @@ export type ConverseStartMessage = {
    * discarding the work if they resume. Default true.
    */
   speculate?: boolean;
+  /**
+   * Consult the model while the user is still speaking, so it can call
+   * `immediate` and `speculative` tools mid-sentence. Costs extra LLM calls
+   * (a few per long sentence); has no effect without such tools. Default true.
+   */
+  actEarly?: boolean;
   /** How long a response waits for a `tool_result` before moving on. */
   toolTimeoutMs?: number;
 };
@@ -139,13 +153,16 @@ export type AssistantDeltaEvent = { type: "assistant_delta"; responseId: string;
 /** Run this tool and answer with a `tool_result` carrying the same `callId`. */
 export type ToolCallEvent = {
   type: "tool_call";
-  responseId: string;
+  /** null for a call made while the user was still speaking (`early`). */
+  responseId: string | null;
   callId: string;
   name: string;
   /** Arguments as a JSON string (as produced by the model: validate it). */
   arguments: string;
   /** Sent before the user's turn was final; a `tool_cancel` may follow. */
   speculative: boolean;
+  /** Decided mid-sentence, while the user was still speaking. */
+  early: boolean;
 };
 
 /** A speculative call is no longer needed: its result will be ignored. */
@@ -208,6 +225,7 @@ export type ConverseStartParams = {
   voice?: string;
   bargeIn: boolean;
   speculate: boolean;
+  actEarly: boolean;
   toolTimeoutMs: number;
 };
 
@@ -263,11 +281,13 @@ function normalizeTools(value: unknown): Required<ToolDefinition>[] | { error: s
       return { error: `Tool "${name}": \`parameters\` must be a JSON Schema object` };
     }
     if (!optionalBoolean(tool["speculative"])) return { error: `Tool "${name}": \`speculative\` must be a boolean` };
+    if (!optionalBoolean(tool["immediate"])) return { error: `Tool "${name}": \`immediate\` must be a boolean` };
     tools.push({
       name,
       description: tool["description"] ?? "",
       parameters: (tool["parameters"] as Record<string, unknown>) ?? { type: "object", properties: {} },
       speculative: tool["speculative"] === true,
+      immediate: tool["immediate"] === true,
     });
   }
   return tools;
@@ -309,7 +329,7 @@ export function normalizeConverseStart(
   for (const key of ["language", "instructions", "provider", "model", "voice"]) {
     if (!optionalString(raw[key])) return { error: `\`${key}\` must be a string` };
   }
-  for (const key of ["bargeIn", "speculate"]) {
+  for (const key of ["bargeIn", "speculate", "actEarly"]) {
     if (!optionalBoolean(raw[key])) return { error: `\`${key}\` must be a boolean` };
   }
   if (raw["contextBias"] !== undefined) {
@@ -367,6 +387,7 @@ export function normalizeConverseStart(
     ...(msg.voice ? { voice: msg.voice } : {}),
     bargeIn: msg.bargeIn !== false,
     speculate: msg.speculate !== false,
+    actEarly: msg.actEarly !== false,
     toolTimeoutMs,
   };
 }
