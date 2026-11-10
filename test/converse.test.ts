@@ -135,6 +135,7 @@ test("a spoken turn gets a spoken reply", async () => {
   assert.equal((await c.next("user_turn")).text, "salut toi");
   const done = await c.next("response_done");
   assert.equal(done.text, "Bonjour à toi. Comment ça va ?");
+  assert.equal(done.speech, "realtime");
   // The text is streamed into the realtime voice, one generation per
   // sentence; the mock yields 9 bytes each, relayed as whole 16-bit samples.
   assert.equal(Buffer.concat(c.audio).toString(), "MOCKAUDIMOCKAUDI");
@@ -417,7 +418,7 @@ test("speech falls back to per-sentence requests when the realtime voice is down
     const c = await open({ voice: "voice_592" });
     await c.next("ready");
     c.sendJson({ type: "text", text: "salut" });
-    await c.next("response_done");
+    assert.equal((await c.next("response_done")).speech, "http"); // the fallback shows
     assert.equal(Buffer.concat(c.audio).toString(), "MOCKAUDI");
     assert.equal(mistral.received.speech?.["voice_id"], "voice_592");
     assert.equal(mistral.received.speech?.["input"], "Première. Deuxième phrase ici.");

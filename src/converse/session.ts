@@ -213,6 +213,8 @@ type ResponseState = {
   finalMessage: AssistantMessage | null;
   ttsChain: Promise<void>;
   ttsFailed: boolean;
+  /** How the audio sent so far was produced (cf. `ResponseDoneEvent.speech`). */
+  speechVia: "realtime" | "http" | null;
   /** Estimated time (ms) the audio sent so far finishes playing. */
   playhead: number;
   onCommit: Array<() => void>;
@@ -525,6 +527,7 @@ export function runConverseSession(
           const segment = (segments[item.segment] ??= { text: "", bytes: 0, complete: false, chunks: [] });
           segment.text = item.text;
           if (item.audio) {
+            response.speechVia = stream.via();
             segment.bytes += item.audio.length;
             emit(response, { audio: item.audio, segment });
           }
@@ -664,7 +667,14 @@ export function runConverseSession(
     response.phase = "done";
     await response.ttsChain;
     if (signal.aborted) return;
-    emit(response, { event: { type: "response_done", responseId: response.id, text: response.text } });
+    emit(response, {
+      event: {
+        type: "response_done",
+        responseId: response.id,
+        text: response.text,
+        ...(response.speechVia ? { speech: response.speechVia } : {}),
+      },
+    });
     if (response.committed) scheduleClear(response);
   };
 
@@ -735,6 +745,7 @@ export function runConverseSession(
       finalMessage: null,
       ttsChain: Promise.resolve(),
       ttsFailed: false,
+      speechVia: null,
       playhead: 0,
       onCommit: [],
       clearTimer: null,

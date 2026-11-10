@@ -194,7 +194,18 @@ export type ToolCallEvent = {
 /** A speculative call is no longer needed: its result will be ignored. */
 export type ToolCancelEvent = { type: "tool_cancel"; callId: string };
 
-export type ResponseDoneEvent = { type: "response_done"; responseId: string; text: string };
+export type ResponseDoneEvent = {
+  type: "response_done";
+  responseId: string;
+  text: string;
+  /**
+   * How the reply was spoken, when it was: `realtime` (text streamed into the
+   * speech model as it was written) or `http` (one request per sentence — the
+   * fallback, slower to start). Seeing `http` on a server set to `realtime`
+   * means the realtime voice is failing.
+   */
+  speech?: "realtime" | "http";
+};
 
 /**
  * The response was cut short (the user spoke, or sent `interrupt`): stop

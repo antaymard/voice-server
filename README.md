@@ -620,7 +620,7 @@ assistant's speech** (PCM s16le mono 24 kHz, see `ready.audio`):
 | `assistant_delta` | `responseId, text` | reply text (arrives ahead of its audio) |
 | `tool_call` | `responseId, callId, name, arguments, speculative, early` | run it, answer with `tool_result`. `arguments` is a JSON string written by the model: validate it. `early`: decided mid-sentence (`responseId` is then `null`) |
 | `tool_cancel` | `callId` | a speculative call is no longer needed |
-| `response_done` | `responseId, text` | the reply is complete |
+| `response_done` | `responseId, text, speech?` | the reply is complete. `speech`: `realtime` or `http` — how it was spoken; `http` on a server set to `realtime` means the realtime voice is failing and the slower fallback took over |
 | `interrupt` | `responseId, heardText` | **stop playback and drop queued audio** |
 | `response_error` | `responseId, code, message` | `llm_error` / `tts_error`; the session goes on |
 | `error` | `code, message` | fatal, same codes as `/v1/realtime`, then close |
@@ -744,7 +744,7 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `BATCH_MODEL` | no | `voxtral-mini-transcribe-3-0` | bulk transcription model (`voxtral-small-transcribe-3-0` = higher quality) |
 | `REALTIME_MODEL` | no | `voxtral-mini-transcribe-realtime-3-0` | realtime model |
 | `TTS_MODEL` | no | `voxtral-mini-tts-3-0` | text-to-speech model |
-| `TTS_VOICE` | no | — | default voice id (empty = Mistral's default) |
+| `TTS_VOICE` | no | set in the `Dockerfile` | default voice id for `/v1/speak` and `/v1/converse`. The image sets this deployment's voice (a custom voice of its Mistral account, used for every language: a Voxtral voice is not tied to one); a variable on the host overrides it. Unset outside Docker = Mistral's default |
 | `TTS_FORMAT` | no | `pcm` | default output format when the request omits one |
 | `MAX_TTS_CHARS` | no | `8000` | max characters per `/v1/speak` request |
 | `MAX_UPLOAD_BYTES` | no | `26214400` (25 MB) | bulk upload cap (also caps `/v1/speak` bodies) |

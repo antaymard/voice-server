@@ -32,6 +32,8 @@ export type TtsStream = {
   /** No more text. */
   end: () => void;
   items: AsyncIterable<TtsItem>;
+  /** How this utterance is being spoken: streamed text, or one request per sentence. */
+  via: () => "realtime" | "http";
 };
 
 /** Opens the voice for one utterance. Aborting the signal silences it. */
@@ -195,6 +197,7 @@ export function createHttpTts(batch: Mistral, config: Config, format: PcmFormat)
         sentences.close();
       },
       items: items(),
+      via: () => "http",
     };
   };
 }
@@ -329,6 +332,7 @@ export function createRealtimeTts(config: Config, format: PcmFormat): Tts {
         finishIfDrained();
       },
       items: out,
+      via: () => "realtime",
     };
   };
 }
@@ -379,6 +383,7 @@ export function withFallback(primary: Tts, fallback: Tts): Tts {
         active.end();
       },
       items: items(),
+      via: () => active.via(),
     };
   };
 }
