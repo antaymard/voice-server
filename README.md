@@ -607,7 +607,11 @@ server: it is ears and mouth for an agent that lives in your app. Each
 finished turn arrives as `user_turn`; you answer by sending the reply's text
 as it is written — `{ "type": "say", "id", "text" }`, several times with the
 same `id`, the last one with `"done": true`. The server speaks it sentence by
-sentence, and still handles turn-taking, barge-in and echo. If the user talks
+sentence, and still handles turn-taking, barge-in and echo. A `say` that
+arrives while a previous one is still being spoken — the same `id` reopened
+after `done`, or a new `id` — is spoken after it, never over it (an agent
+writes, works, then writes again); they share one `responseId`, and each
+gets its own `response_start` and `response_done`. If the user talks
 over a reply, you get `interrupt` with its `sayId`, and anything else sent
 under that `id` is dropped (keep streaming, the server sorts it out); a reply
 does not start while the user is speaking either. `response_start`,
@@ -760,7 +764,7 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `BATCH_MODEL` | no | `voxtral-mini-transcribe-3-0` | bulk transcription model (`voxtral-small-transcribe-3-0` = higher quality) |
 | `REALTIME_MODEL` | no | `voxtral-mini-transcribe-realtime-3-0` | realtime model |
 | `TTS_MODEL` | no | `voxtral-mini-tts-3-0` | text-to-speech model |
-| `TTS_VOICE` | no | set in the `Dockerfile` | default voice id for `/v1/speak` and `/v1/converse`. The image sets this deployment's voice (a custom voice of its Mistral account, used for every language: a Voxtral voice is not tied to one); a variable on the host overrides it. Unset outside Docker = Mistral's default |
+| `TTS_VOICE` | no | set in the `Dockerfile` | default voice id for `/v1/speak` and `/v1/converse`. The image sets this deployment's voice (a Mistral preset voice, used for every language: a Voxtral voice is not tied to one); a variable on the host overrides it. Unset outside Docker = Mistral's default |
 | `TTS_FORMAT` | no | `pcm` | default output format when the request omits one |
 | `MAX_TTS_CHARS` | no | `8000` | max characters per `/v1/speak` request |
 | `MAX_UPLOAD_BYTES` | no | `26214400` (25 MB) | bulk upload cap (also caps `/v1/speak` bodies) |

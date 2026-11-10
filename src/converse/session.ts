@@ -224,6 +224,8 @@ type ResponseState = {
   clearTimer: NodeJS.Timeout | null;
   /** Set when the reply is the client's own text (cf. the `say` message). */
   sayId?: string;
+  /** For a `say` reply: the sentences of each of its parts, in speaking order. */
+  sayParts?: Segment[][];
 };
 
 type ToolWaiter = {
@@ -698,7 +700,7 @@ export function runConverseSession(
 
   /** Cut a response the user was hearing; the history keeps what they heard. */
   const interrupt = (response: ResponseState): void => {
-    const heard = heardText(response.segments, Date.now());
+    const heard = heardText(response.sayParts?.flat() ?? response.segments, Date.now());
     response.abort.abort();
     if (response.clearTimer) clearTimeout(response.clearTimer);
     if (response.phase === "llm") {
@@ -1019,34 +1021,14 @@ export function runConverseSession(
     if (mutedSays.length > 50) mutedSays.shift();
   };
 
-  const onSay = (id: string, text: string, done: boolean): void => {
-    if (mutedSays.includes(id)) return;
-    if (speaking?.id !== id) {
-      // The user has the floor: a reply does not start over them.
-      if (turnOpen && !suspect) {
-        muteSay(id);
-        return;
-      }
-      stopCurrent();
-      const response = newResponse(null, true);
-      response.sayId = id;
-      response.phase = "done"; // nothing of it goes to this server's history
-      current = response;
-      audible = response;
-      const stream = deps.tts({ voice: params?.voice, signal: response.abort.signal });
-      pumpSpeech(response, stream, response.segments);
-      speaking = { id, response, stream };
-      send({ type: "response_start", responseId: response.id, sayId: id });
-    }
-    const { response, stream } = speaking;
-    if (text) {
-      response.text += text;
-      stream.write(text);
-    }
-    if (!done) return;
+  /** The part being received is complete: its last sentence is spoken. */
+  const endSay = (): void => {
+    if (!speaking) return;
+    const { id, response, stream } = speaking;
     speaking = null;
     stream.end();
-    void response.ttsChain.then(() => {
+    const spokenUpTo = response.ttsChain;
+    void spokenUpTo.then(() => {
       if (response.abort.signal.aborted) return;
       send({
         type: "response_done",
@@ -1055,8 +1037,45 @@ export function runConverseSession(
         sayId: id,
         ...(response.speechVia ? { speech: response.speechVia } : {}),
       });
-      scheduleClear(response);
+      // Unless more of the reply has come in the meantime.
+      if (response.ttsChain === spokenUpTo) scheduleClear(response);
     });
+  };
+
+  const onSay = (id: string, text: string, done: boolean): void => {
+    if (mutedSays.includes(id)) return;
+    if (speaking?.id !== id) {
+      // The user has the floor: a reply does not start over them.
+      if (turnOpen && !suspect) {
+        muteSay(id);
+        return;
+      }
+      // A reply still being spoken is not cut by the next one: an agent
+      // writes a few words, works, then writes again (under the same id or a
+      // new one), and all of it is one reply to the listener.
+      endSay(); // a part left open is over once another one starts
+      const spoken = current?.sayParts && !current.abort.signal.aborted ? current : null;
+      if (!spoken) stopCurrent();
+      const response = spoken ?? newResponse(null, true);
+      if (response.clearTimer) clearTimeout(response.clearTimer);
+      response.clearTimer = null;
+      response.sayId = id;
+      response.phase = "done"; // nothing of it goes to this server's history
+      current = response;
+      audible = response;
+      const stream = deps.tts({ voice: params?.voice, signal: response.abort.signal });
+      const segments: Segment[] = [];
+      (response.sayParts ??= []).push(segments);
+      pumpSpeech(response, stream, segments);
+      speaking = { id, response, stream };
+      send({ type: "response_start", responseId: response.id, sayId: id });
+    }
+    const { response, stream } = speaking;
+    if (text) {
+      response.text += text;
+      stream.write(text);
+    }
+    if (done) endSay();
   };
 
   const commitTurn = (): void => {

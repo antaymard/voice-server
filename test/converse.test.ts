@@ -544,6 +544,31 @@ test("client brain: the turn is handed to the client, and its text is spoken as 
   c.ws.close();
 });
 
+test("client brain: a reply that resumes after a pause is spoken after what came before, not over it", async () => {
+  const c = await open({ brain: "client" });
+  await c.next("ready");
+  // The agent writes, closes its message to work, then writes again.
+  c.sendJson({ type: "say", id: "msg_1", text: "Je regarde le canvas.", done: true });
+  c.sendJson({ type: "say", id: "msg_1", text: "Trois nodes trouvés.", done: true });
+  c.sendJson({ type: "say", id: "msg_2", text: "Je les ai regroupés.", done: true });
+  while (c.events.filter((e) => e.type === "response_done").length < 3) await sleep(10);
+
+  assert.equal(c.events.some((e) => e.type === "interrupt"), false);
+  assert.equal(Buffer.concat(c.audio).toString(), "MOCKAUDI".repeat(3));
+  const done = c.events.filter((e) => e.type === "response_done");
+  assert.deepEqual(done.map((e) => e.sayId), ["msg_1", "msg_1", "msg_2"]);
+  assert.equal(new Set(done.map((e) => e.responseId)).size, 1); // one reply to the listener
+
+  // Talking over it still cuts all of it.
+  c.sendJson({ type: "say", id: "msg_2", text: "Et voici une suite. " });
+  const audioBefore = c.audio.length;
+  while (c.audio.length === audioBefore) await sleep(10);
+  c.turn("start");
+  c.say("stop");
+  assert.equal((await c.next("interrupt")).sayId, "msg_2");
+  c.ws.close();
+});
+
 test("client brain: talking over a reply cuts it, and the rest of that reply is dropped", async () => {
   const c = await open({ brain: "client" });
   await c.next("ready");
@@ -574,14 +599,19 @@ test("client brain: talking over a reply cuts it, and the rest of that reply is 
   c.ws.close();
 });
 
-test("client brain: a new reply replaces the one still playing", async () => {
+test("client brain: a new reply follows the one still playing", async () => {
   const c = await open({ brain: "client" });
   await c.next("ready");
   c.sendJson({ type: "say", id: "a", text: "Première réponse en cours. " });
   await c.next("response_start");
   c.sendJson({ type: "say", id: "b", text: "Seconde réponse.", done: true });
-  assert.equal((await c.next("interrupt")).sayId, "a");
-  assert.equal((await c.next("response_done")).sayId, "b");
+  while (c.events.filter((e) => e.type === "response_done").length < 2) await sleep(10);
+  assert.equal(c.events.some((e) => e.type === "interrupt"), false);
+  assert.deepEqual(
+    c.events.filter((e) => e.type === "response_done").map((e) => e.sayId),
+    ["a", "b"],
+  );
+  assert.equal(Buffer.concat(c.audio).toString(), "MOCKAUDIMOCKAUDI");
   c.ws.close();
 });
 

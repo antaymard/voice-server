@@ -9,11 +9,11 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:22-slim
 ENV NODE_ENV=production
-# Default voice of this deployment: the custom voice "Antoine" of the Mistral
-# account behind MISTRAL_API_KEY, used for every language. A TTS_VOICE variable
+# Default voice of this deployment: Mistral's preset voice "Lea", used for
+# every language. A TTS_VOICE variable
 # set on the host (Railway) overrides it; a client can still pick another
 # voice per request.
-ENV TTS_VOICE=4fd7e597-973c-4a76-a241-154acfa0dd86
+ENV TTS_VOICE=01a151d2-8c29-766d-9ca2-30f33707cef6
 # ffmpeg/ffprobe power /v1/media/* (audio extraction, silence detection,
 # re-encoding). Debian's build ships libmp3lame and libopus; fail the build
 # if that ever changes.
