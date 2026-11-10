@@ -98,6 +98,10 @@ const CLAUSE_BOUNDARY = /[,;:.!?…]/;
 const GATED_MIN_NEW_WORDS = 2;
 /** Below this probability of "the user has finished", the turn is held open… */
 const UNFINISHED_BELOW = 0.3;
+/** Above this one, the reply starts at once instead of waiting out the pause. */
+const FINISHED_ABOVE = 0.85;
+/** Recent messages shown to the decision model for context. */
+const DECISION_CONTEXT_MESSAGES = 4;
 /** …for this long, in case they pick their sentence back up. */
 const HOLD_OPEN_MS = 1200;
 
@@ -117,7 +121,9 @@ const INTENT_QUESTION: DecisionQuestion = {
 const FINISHED_QUESTION: DecisionQuestion = {
   type: "noul",
   instructions:
-    "In a spoken conversation, the user paused after saying `user_said`. Have they finished what they wanted to say?",
+    "In a spoken conversation (`conversation` is how it went so far), the user has just paused. `user_said` is " +
+    "everything they said this turn, `last_segment` the part since their previous pause. Have they finished what " +
+    "they wanted to say, so that the assistant should start preparing its reply now?",
   criteria: {
     true: "The utterance is complete: a whole request, question, answer or remark that can be responded to.",
     false:
@@ -299,6 +305,10 @@ export function runConverseSession(
   let completeness: { text: string; verdict: Promise<number | null> } | null = null;
   /** The turn's end was put off once already, waiting for the user to go on. */
   let heldOpen = false;
+  /** The user has paused (eager end) and has not resumed since. */
+  let pausing = false;
+  /** Length of the turn's transcript when the user last resumed after a pause. */
+  let segmentStart = 0;
   let deciderWarned = false;
 
   const deciding = (): boolean => deps.decider !== null && params?.decide === true;
@@ -873,19 +883,38 @@ export function runConverseSession(
   const askCompleteness = (): void => {
     const text = userBuffer.trim();
     if (!deciding() || suspect || !text || completeness?.text === text) return;
-    const last = history[history.length - 1];
+    // The same words can be complete or not depending on what came before
+    // ("red" answers "which color?"), so the model gets the recent exchange.
+    const conversation = history
+      .filter((m): m is Extract<ChatMessage, { role: "user" | "assistant" }> & { content: string } =>
+        (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content !== "",
+      )
+      .slice(-DECISION_CONTEXT_MESSAGES)
+      .map((m) => ({ role: m.role, said: m.content }));
+    const lastSegment = userBuffer.slice(Math.min(segmentStart, userBuffer.length)).trim();
     completeness = {
       text,
-      verdict: ask(FINISHED_QUESTION, {
-        ...(last?.role === "assistant" && last.content ? { assistant_said_before: last.content } : {}),
-        user_said: text,
-      }).then((answer) => (answer?.type === "noul" ? answer.noul : null)),
+      verdict: ask(FINISHED_QUESTION, { conversation, user_said: text, last_segment: lastSegment || text }).then(
+        (answer) => (answer?.type === "noul" ? answer.noul : null),
+      ),
     };
+    void completeness.verdict.then((finishedProbability) => {
+      // Clearly complete: no need to wait out the rest of the pause.
+      const waiting = pausing || settleTimer !== null;
+      if (finishedProbability === null || finishedProbability < FINISHED_ABOVE) return;
+      if (finished || suspect || !waiting || userBuffer.trim() !== text) return;
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = null;
+      turnOpen = false;
+      finalizeTurn(text);
+    });
   };
 
   const finalizeTurn = (text: string): void => {
     userBuffer = "";
     heldOpen = false;
+    pausing = false;
+    segmentStart = 0;
     completeness = null;
     send({ type: "user_turn", text });
     if (current && !current.committed && current.userText === text) commit(current);
@@ -942,6 +971,8 @@ export function runConverseSession(
     if (settleTimer) armSettle();
     reviewSuspect();
     if (suspect) return;
+    // The transcript trails the voice: words still land after the pause began.
+    if (pausing || settleTimer) askCompleteness();
     // More words arrived after we started guessing: guess again.
     if (current && !current.committed && current.userText !== userBuffer.trim()) {
       discardSpeculative(current);
@@ -950,13 +981,20 @@ export function runConverseSession(
     considerEarlyLook(text);
   };
 
-  const onTurn = (phase: TurnPhase): void => {
+  const onTurn = (reported: TurnPhase): void => {
     if (deaf()) return;
+    // We may have answered at the pause without waiting for the turn's end;
+    // the user picking up again is then a new turn talking over the reply.
+    const phase: TurnPhase = reported === "resume" && current?.committed ? "start" : reported;
+    if (phase === "start" || phase === "resume") {
+      pausing = false;
+      segmentStart = userBuffer.length;
+    }
     if (phase === "start" && !settleTimer) {
       if (current?.committed) suspect = true;
       else if (suspect) dropTurn(); // leftovers of an echo that never ended
     }
-    tell({ type: "turn", phase });
+    tell({ type: "turn", phase: reported });
     switch (phase) {
       case "start":
         turnOpen = true;
@@ -970,6 +1008,7 @@ export function runConverseSession(
         if (!suspect) stopCurrent();
         return;
       case "eager_end":
+        pausing = true;
         askCompleteness();
         if (!suspect && params?.speculate && !current && userBuffer.trim()) {
           startResponse(userBuffer.trim(), false);

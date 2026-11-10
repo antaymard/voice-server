@@ -473,8 +473,11 @@ What the server does for you:
 - **Decides fast.** With a decision model configured (`OPENROUTER_API_KEY`),
   three judgment calls go to it instead of a rule of thumb: whether speech
   over the assistant is an interruption, a mere "yes, ok" (it keeps talking)
-  or its own echo; whether a sentence was left hanging (the turn is held
-  open up to 1.2 s instead of being answered half-said); and whether there is
+  or its own echo; whether the user, at a pause, has finished — judged on the
+  recent exchange, the whole turn and its last segment: a sentence left
+  hanging keeps the turn open up to 1.2 s instead of being answered
+  half-said, and a clearly finished one is answered at once, without waiting
+  out the pause; and whether there is
   already something to act on mid-sentence (the LLM is only woken then, and
   the check runs every two words instead of at each clause). If the model is
   slow (`DECIDER_TIMEOUT_MS`) or fails, the rules of thumb take over.

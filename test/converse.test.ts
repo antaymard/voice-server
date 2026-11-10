@@ -573,6 +573,38 @@ test("decider: a sentence left hanging is given time to be finished", async () =
   c.ws.close();
 });
 
+test("decider: a clearly finished sentence is answered at the pause, with the context it was judged on", async () => {
+  llm.onDecision = (_id, _q, state) => noul(String(state["user_said"]).endsWith("rouge") ? 0.95 : 0.5);
+  // The middle reply is the guess prepared at the first pause, thrown away on resume.
+  llm.script({ text: ["Quelle couleur ?"] }, { text: ["Euh ?"] }, { text: ["Rouge, donc."] });
+  const c = await open({}, deciding);
+  await c.next("ready");
+  c.sendJson({ type: "text", text: "change la couleur" });
+  await c.next("response_done");
+  await sleep(350);
+
+  c.turn("start");
+  c.say("euh");
+  c.turn("eager_end");
+  await sleep(120);
+  assert.equal(c.events.filter((e) => e.type === "user_turn").length, 1); // unsure: wait for the turn to end
+  c.turn("resume");
+  c.say(" rouge");
+  c.turn("eager_end");
+  // No `end` is ever sent: the decision alone releases the reply.
+  assert.equal((await c.next("user_turn", 1)).text, "euh rouge");
+  assert.equal((await c.next("response_done", 1)).text, "Rouge, donc.");
+  assert.deepEqual(llm.decisions.at(-1)?.state, {
+    conversation: [
+      { role: "user", said: "change la couleur" },
+      { role: "assistant", said: "Quelle couleur ?" },
+    ],
+    user_said: "euh rouge",
+    last_segment: "rouge",
+  });
+  c.ws.close();
+});
+
 test("decider: a hanging sentence is still answered if the user does not go on", async () => {
   llm.onDecision = () => noul(0.05);
   const c = await open({ speculate: false }, deciding);
