@@ -8,6 +8,7 @@ import { createMediaJobs } from "./media/jobs.ts";
 import { createMistralClients } from "./mistral.ts";
 import { attachRealtime, type RealtimeControl } from "./realtime/server.ts";
 import { openAiCompatibleLlm } from "./converse/llm.ts";
+import { createDecider } from "./decide.ts";
 import { createVoxtralTts } from "./converse/tts.ts";
 
 export type RunningServer = {
@@ -19,10 +20,12 @@ export function startServer(config: Config): Promise<RunningServer> {
   const { batch, realtime } = createMistralClients(config);
   const gladia = config.gladiaApiKey ? createGladiaClient(config) : null;
   const media = createMediaJobs(config);
+  const decider = createDecider(config);
   let control: RealtimeControl | null = null;
   const app = createApp(config, {
     batch,
     gladia,
+    decider,
     activeSessions: () => control?.activeSessions() ?? 0,
     media,
   });
@@ -44,7 +47,7 @@ export function startServer(config: Config): Promise<RunningServer> {
       {
         realtime,
         gladia,
-        converse: { realtime, llm: openAiCompatibleLlm, tts: createVoxtralTts(batch, config) },
+        converse: { realtime, llm: openAiCompatibleLlm, tts: createVoxtralTts(batch, config), decider },
       },
       config,
     );

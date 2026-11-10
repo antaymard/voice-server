@@ -23,6 +23,7 @@ const TOOLS = [
   {
     name: "set_accent_color",
     description: "Change the accent color of the page.",
+    immediate: true, // harmless to redo: may run while the user is still mid-sentence
     parameters: {
       type: "object",
       properties: { color: { type: "string", description: "A CSS color, e.g. #e5534b or teal" } },
@@ -121,7 +122,8 @@ function cleanup() {
 
 async function runTool(ws, ev) {
   const tool = TOOLS.find((t) => t.name === ev.name);
-  const line = bubble("tool", `${ev.speculative ? "(early) " : ""}${ev.name}(${ev.arguments})`);
+  const when = ev.early ? "(mid-sentence) " : ev.speculative ? "(before you finished) " : "";
+  const line = bubble("tool", `${when}${ev.name}(${ev.arguments})`);
   let output;
   let isError = false;
   try {
@@ -143,7 +145,9 @@ function handleEvent(ws, ev) {
       player.rate = ev.audio.sampleRate;
       setStatus("listening", "live");
       for (const id of ["stop", "hush", "typed"]) $(id).disabled = false;
-      $("meta").textContent = `${ev.llmProvider} / ${ev.llmModel} · ${ev.sttModel} · ${ev.ttsModel}`;
+      $("meta").textContent =
+        `${ev.llmProvider} / ${ev.llmModel} · ${ev.sttModel} · ${ev.ttsModel}` +
+        (ev.deciderModel ? ` · decisions: ${ev.deciderModel}` : "");
       break;
     case "transcript":
       if (!view.liveUser) view.liveUser = bubble("user live");

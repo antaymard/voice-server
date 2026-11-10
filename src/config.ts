@@ -32,14 +32,26 @@ export type Config = {
   mistralWsUrl: string;
   /**
    * LLM endpoints for /v1/converse, by name. "default" always exists (Mistral
-   * unless LLM_BASE_URL says otherwise); others come from
+   * unless LLM_BASE_URL says otherwise); "openrouter" exists when
+   * OPENROUTER_API_KEY is set; others come from
    * LLM_PROVIDER_<NAME>_BASE_URL / _API_KEY.
    */
   llmProviders: Record<string, LlmProvider>;
-  /** Model used when a conversation doesn't ask for one (default provider). */
+  /** Provider and model used when a conversation doesn't ask for one. */
+  llmDefaultProvider: string;
   llmModel: string;
   /** What a client may pick per conversation besides the default; "*" = anything. */
   llmAllowedModels: "*" | { provider: string; model: string }[];
+  /**
+   * Decision ("System One") model access: OpenRouter's Decisions API by
+   * default. An empty key disables /v1/decide and the conversation's fast
+   * decisions (it then relies on simple rules).
+   */
+  deciderUrl: string;
+  deciderApiKey: string;
+  deciderModel: string;
+  /** A conversation waits at most this long for a decision before using its rule of thumb. */
+  deciderTimeoutMs: number;
   /**
    * How /v1/converse speaks: "realtime" streams the reply's text into
    * Mistral's speech WebSocket as it is written (falls back to "http" when
@@ -139,6 +151,23 @@ function parseHostList(raw: string | undefined): string[] {
 }
 
 const PROVIDER_ENV = /^LLM_PROVIDER_([A-Z0-9_]+)_BASE_URL$/;
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+/** Used when an OpenRouter key is the only LLM setting given. */
+const OPENROUTER_DEFAULT_MODEL = "anthropic/claude-haiku-5.5";
+
+/**
+ * `model` (default provider) or `provider:model`. Model ids can contain ":"
+ * themselves (e.g. "llama3:8b"): only a known provider name counts as a prefix.
+ */
+function parseModelRef(
+  entry: string,
+  providers: Record<string, LlmProvider>,
+): { provider: string; model: string } {
+  const colon = entry.indexOf(":");
+  const prefix = colon > 0 ? entry.slice(0, colon).toLowerCase() : "";
+  if (prefix && providers[prefix]) return { provider: prefix, model: entry.slice(colon + 1) };
+  return { provider: "default", model: entry };
+}
 
 function loadLlmProviders(
   env: Record<string, string | undefined>,
@@ -149,6 +178,9 @@ function loadLlmProviders(
       apiKey: env["LLM_API_KEY"] || env["MISTRAL_API_KEY"] || "",
     },
   };
+  if (env["OPENROUTER_API_KEY"]) {
+    providers["openrouter"] = { baseUrl: OPENROUTER_BASE_URL, apiKey: env["OPENROUTER_API_KEY"] };
+  }
   for (const [key, value] of Object.entries(env)) {
     const match = PROVIDER_ENV.exec(key);
     if (!match || !value) continue;
@@ -171,14 +203,7 @@ function parseAllowedModels(
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean)
-    .map((entry) => {
-      // Model ids can contain ":" themselves (e.g. "llama3:8b"): only a known
-      // provider name counts as a prefix.
-      const colon = entry.indexOf(":");
-      const prefix = colon > 0 ? entry.slice(0, colon).toLowerCase() : "";
-      if (prefix && providers[prefix]) return { provider: prefix, model: entry.slice(colon + 1) };
-      return { provider: "default", model: entry };
-    });
+    .map((entry) => parseModelRef(entry, providers));
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -218,6 +243,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   }
 
   const llmProviders = loadLlmProviders(env);
+  // An explicit LLM_MODEL (or a custom default endpoint) wins; otherwise an
+  // OpenRouter key alone is taken as "use OpenRouter".
+  const defaultLlm = env["LLM_MODEL"]
+    ? parseModelRef(env["LLM_MODEL"], llmProviders)
+    : llmProviders["openrouter"] && !env["LLM_BASE_URL"]
+      ? { provider: "openrouter", model: OPENROUTER_DEFAULT_MODEL }
+      : { provider: "default", model: "mistral-small-latest" };
 
   const converseTts = env["CONVERSE_TTS"] || "realtime";
   if (converseTts !== "realtime" && converseTts !== "http") {
@@ -247,8 +279,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     mistralBaseUrl: env["MISTRAL_BASE_URL"] || "https://api.mistral.ai",
     mistralWsUrl: env["MISTRAL_WS_URL"] || "wss://api.mistral.ai",
     llmProviders,
-    llmModel: env["LLM_MODEL"] || "mistral-small-latest",
+    llmDefaultProvider: defaultLlm.provider,
+    llmModel: defaultLlm.model,
     llmAllowedModels: parseAllowedModels(env["LLM_MODELS"], llmProviders),
+    deciderUrl: env["DECIDER_URL"] || "https://openrouter.ai/api/alpha/decisions",
+    deciderApiKey: env["DECIDER_API_KEY"] || env["OPENROUTER_API_KEY"] || "",
+    deciderModel: env["DECIDER_MODEL"] || "typesafe/jev-1.13",
+    deciderTimeoutMs: intEnv(env, "DECIDER_TIMEOUT_MS", 400),
     converseTts,
     ttsPcmEncoding,
     converseSettleMs: intEnv(env, "CONVERSE_SETTLE_MS", 150),

@@ -2,6 +2,10 @@
  * Mock of an OpenAI-compatible chat-completions endpoint (streaming), for
  * /v1/converse tests. Each request consumes the next scripted reply; with
  * none left it answers "ok.". Requests are recorded on `requests`.
+ *
+ * Also mocks OpenRouter's Decisions API (POST /alpha/decisions): each
+ * question is answered by `onDecision(questionId, question, state)`; with no
+ * handler, or when it returns "fail", the request gets a 500.
  */
 import { createServer } from "node:http";
 
@@ -21,6 +25,10 @@ export type MockLlm = {
   baseUrl: string;
   requests: Array<{ authorization: string; body: Record<string, unknown> }>;
   script: (...replies: ScriptedReply[]) => void;
+  decisionsUrl: string;
+  decisions: Array<{ model: string; state: Record<string, unknown>; questions: Record<string, { type: string }> }>;
+  /** Answers decision questions; set per test. */
+  onDecision: ((id: string, question: { type: string }, state: Record<string, unknown>) => unknown) | null;
   close: () => Promise<void>;
 };
 
@@ -29,11 +37,25 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 export function startMockLlm(): Promise<MockLlm> {
   const requests: MockLlm["requests"] = [];
   const queue: ScriptedReply[] = [];
+  const decisions: MockLlm["decisions"] = [];
+  const hooks: { onDecision: MockLlm["onDecision"] } = { onDecision: null };
   const server = createServer((req, res) => {
     let raw = "";
     req.on("data", (chunk) => (raw += chunk));
     req.on("end", () => {
       void (async () => {
+        if (req.method === "POST" && req.url === "/alpha/decisions") {
+          const body = JSON.parse(raw) as MockLlm["decisions"][number];
+          decisions.push(body);
+          const answers: Record<string, unknown> = {};
+          for (const [id, question] of Object.entries(body.questions)) {
+            answers[id] = hooks.onDecision ? hooks.onDecision(id, question, body.state) : "fail";
+          }
+          const failed = Object.values(answers).includes("fail");
+          res.writeHead(failed ? 500 : 200, { "content-type": "application/json" });
+          res.end(JSON.stringify(failed ? { error: { message: "mock decision failure" } } : { id: "dec_1", model: body.model, provider: "Mock", answers, usage: { input_tokens: 10 } }));
+          return;
+        }
         if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
           res.writeHead(404).end();
           return;
@@ -69,6 +91,14 @@ export function startMockLlm(): Promise<MockLlm> {
         baseUrl: `http://127.0.0.1:${port}/v1`,
         requests,
         script: (...replies) => void queue.push(...replies),
+        decisionsUrl: `http://127.0.0.1:${port}/alpha/decisions`,
+        decisions,
+        get onDecision() {
+          return hooks.onDecision;
+        },
+        set onDecision(handler) {
+          hooks.onDecision = handler;
+        },
         close: () =>
           new Promise<void>((done) => {
             server.closeAllConnections();

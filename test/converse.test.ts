@@ -14,6 +14,8 @@ import { makeConfig, TEST_TOKEN } from "./helpers.ts";
 let mistral: MockMistral;
 let llm: MockLlm;
 let server: RunningServer;
+/** Same server, with a decision model configured. */
+let deciding: RunningServer;
 
 before(async () => {
   mistral = await startMockMistral();
@@ -29,9 +31,19 @@ before(async () => {
       llmAllowedModels: [{ provider: "other", model: "big-model" }],
     }),
   );
+  deciding = await startServer(
+    makeConfig({
+      mistralBaseUrl: mistral.httpUrl,
+      mistralWsUrl: mistral.wsUrl,
+      llmProviders: { default: { baseUrl: llm.baseUrl, apiKey: "default-key" } },
+      deciderUrl: llm.decisionsUrl,
+      deciderApiKey: "decider-key",
+    }),
+  );
 });
 
 after(async () => {
+  await deciding.close();
   await server.close();
   await llm.close();
   await mistral.close();
@@ -39,6 +51,8 @@ after(async () => {
 
 beforeEach(() => {
   llm.requests.length = 0;
+  llm.decisions.length = 0;
+  llm.onDecision = null;
 });
 
 type Client = {
@@ -56,8 +70,8 @@ type Client = {
   sendJson: (message: unknown) => void;
 };
 
-async function open(start: Omit<ConverseStartMessage, "type"> = {}): Promise<Client> {
-  const ws = new WebSocket(`ws://127.0.0.1:${server.port}/v1/converse?token=${TEST_TOKEN}`);
+async function open(start: Omit<ConverseStartMessage, "type"> = {}, target: RunningServer = server): Promise<Client> {
+  const ws = new WebSocket(`ws://127.0.0.1:${target.port}/v1/converse?token=${TEST_TOKEN}`);
   const events: ConverseServerEvent[] = [];
   const audio: Buffer[] = [];
   const listeners = new Set<() => void>();
@@ -250,6 +264,59 @@ test("speculative tools run before the turn is final and can be cancelled; other
   c.ws.close();
 });
 
+test("it acts in the middle of the user's sentence, and the reply knows what was done", async () => {
+  const tools = [{ name: "set_color", immediate: true }, { name: "send_email" }];
+  llm.script(
+    { toolCalls: [{ id: "early_1", name: "set_color", arguments: '{"color":"red"}' }] },
+    { text: ["C'est rouge, et bonjour !"] },
+  );
+  const c = await open({ tools });
+  await c.next("ready");
+  c.turn("start");
+  c.say("mets la page en rouge");
+  await sleep(60);
+  assert.equal(llm.requests.length, 0); // no clause boundary yet: the model is not bothered
+  c.say(",");
+
+  const call = await c.next("tool_call");
+  assert.deepEqual(
+    { name: call.name, early: call.early, responseId: call.responseId },
+    { name: "set_color", early: true, responseId: null },
+  );
+  assert.equal(c.events.some((e) => e.type === "user_turn"), false); // still mid-sentence
+  const early = llm.requests[0]?.body as { messages: Array<Record<string, unknown>>; tools: Array<{ function: { name: string } }> };
+  assert.match(String(early.messages[0]?.["content"]), /LISTENING MODE/);
+  assert.deepEqual(early.messages.at(-1), { role: "user", content: "mets la page en rouge," });
+  assert.deepEqual(early.tools.map((t) => t.function.name), ["set_color"]); // send_email must wait
+  c.sendJson({ type: "tool_result", callId: call.callId, output: '{"ok":true}' });
+
+  c.say(" et dis bonjour");
+  c.turn("end");
+  assert.equal((await c.next("response_done")).text, "C'est rouge, et bonjour !");
+  assert.equal(c.events.filter((e) => e.type === "tool_call").length, 1);
+  const final = messagesOf(llm.requests.length - 1);
+  assert.doesNotMatch(String(final[0]?.["content"]), /LISTENING MODE/);
+  assert.deepEqual(final[1], { role: "user", content: "mets la page en rouge, et dis bonjour" });
+  assert.equal((final[2]?.["tool_calls"] as Array<{ id: string }>)[0]?.id, "early_1");
+  assert.deepEqual(final[3], { role: "tool", tool_call_id: "early_1", name: "set_color", content: '{"ok":true}' });
+  c.ws.close();
+});
+
+test("without tools allowed to run early, the model is only consulted once the user is done", async () => {
+  llm.script({ text: ["D'accord."] });
+  const c = await open({ tools: [{ name: "send_email" }] });
+  await c.next("ready");
+  c.turn("start");
+  c.say("écris à Paul pour lui dire que,");
+  c.say(" finalement, je viens demain matin avec les documents signés");
+  await sleep(80);
+  assert.equal(llm.requests.length, 0);
+  c.turn("end");
+  await c.next("response_done");
+  assert.equal(llm.requests.length, 1);
+  c.ws.close();
+});
+
 test("barge-in cuts the reply and the model remembers only what was heard", async () => {
   llm.script({ text: ["Première phrase. ", "Deuxième phrase jamais"], hangMs: 2000 }, { text: ["D'accord."] });
   const c = await open();
@@ -432,4 +499,186 @@ test("raw pcm is recognized as 16-bit or float and always leaves as 16-bit", () 
   const kept = [intDecoder.push(asInt), intDecoder.flush()];
   assert.equal(intFormat.encoding, "s16le");
   assert.deepEqual(Buffer.concat(kept.filter((b): b is Buffer => b !== null)), asInt);
+});
+
+test("an OpenRouter key alone selects OpenRouter; LLM_MODEL still decides when set", () => {
+  const base = { MISTRAL_API_KEY: "m", AUTH_TOKEN: "x".repeat(32), ALLOWED_ORIGINS: "*", OPENROUTER_API_KEY: "or-key" };
+  const auto = loadConfig(base);
+  assert.deepEqual(auto.llmProviders["openrouter"], { baseUrl: "https://openrouter.ai/api/v1", apiKey: "or-key" });
+  assert.deepEqual([auto.llmDefaultProvider, auto.llmModel], ["openrouter", "anthropic/claude-haiku-5.5"]);
+
+  const pinned = loadConfig({ ...base, LLM_MODEL: "openrouter:openai/gpt-x" });
+  assert.deepEqual([pinned.llmDefaultProvider, pinned.llmModel], ["openrouter", "openai/gpt-x"]);
+
+  const mistral = loadConfig({ ...base, LLM_MODEL: "mistral-large-latest" });
+  assert.deepEqual([mistral.llmDefaultProvider, mistral.llmModel], ["default", "mistral-large-latest"]);
+
+  const none = loadConfig({ ...base, OPENROUTER_API_KEY: undefined });
+  assert.deepEqual([none.llmDefaultProvider, none.llmModel], ["default", "mistral-small-latest"]);
+});
+
+// --- With a decision ("System One") model -----------------------------------
+
+const noul = (p: number) => ({ type: "noul", noul: p, confidence: 0.9 });
+
+test("decider: an acknowledgement does not cut the assistant off, an objection does", async () => {
+  llm.onDecision = (_id, question, state) =>
+    question.type === "choice"
+      ? { type: "choice", choice: String(state["microphone_heard"]).includes("attends") ? "interrupt" : "backchannel" }
+      : noul(0.9);
+  llm.script({ text: ["Voici une longue explication. ", "Elle continue encore"], hangMs: 1500 }, { text: ["Oui ?"] });
+  const c = await open({}, deciding);
+  assert.equal((await c.next("ready")).deciderModel, "mock-decider");
+  c.sendJson({ type: "text", text: "explique" });
+  while (c.audio.length === 0) await sleep(10);
+
+  // The word-overlap rule alone would take this for the user cutting in.
+  c.turn("start");
+  c.say("ok d'accord");
+  c.turn("end");
+  await sleep(150);
+  assert.equal(c.events.some((e) => e.type === "interrupt"), false);
+  assert.deepEqual(llm.decisions[0]?.state, {
+    assistant_is_saying: "Voici une longue explication. Elle continue encore",
+    microphone_heard: "ok d'accord",
+  });
+
+  c.turn("start");
+  c.say("non attends");
+  await c.next("interrupt");
+  c.turn("end");
+  assert.equal((await c.next("user_turn", 1)).text, "non attends");
+  await c.next("response_done");
+  c.ws.close();
+});
+
+test("decider: a sentence left hanging is given time to be finished", async () => {
+  llm.onDecision = (_id, _q, state) => noul(String(state["user_said"]).endsWith("que tu") ? 0.05 : 0.95);
+  llm.script({ text: ["C'est fait."] });
+  const c = await open({ speculate: false }, deciding);
+  await c.next("ready");
+  c.turn("start");
+  c.say("je voudrais que tu");
+  c.turn("end");
+  await sleep(250);
+  assert.equal(c.events.some((e) => e.type === "user_turn"), false); // held open, not answered
+  assert.equal(llm.requests.length, 0);
+
+  c.turn("start");
+  c.say(" changes la couleur");
+  c.turn("end");
+  assert.equal((await c.next("user_turn")).text, "je voudrais que tu changes la couleur");
+  await c.next("response_done");
+  assert.equal(llm.requests.length, 1);
+  c.ws.close();
+});
+
+test("decider: a clearly finished sentence is answered at the pause, with the context it was judged on", async () => {
+  llm.onDecision = (_id, _q, state) => noul(String(state["user_said"]).endsWith("rouge") ? 0.95 : 0.5);
+  // The middle reply is the guess prepared at the first pause, thrown away on resume.
+  llm.script({ text: ["Quelle couleur ?"] }, { text: ["Euh ?"] }, { text: ["Rouge, donc."] });
+  const c = await open({}, deciding);
+  await c.next("ready");
+  c.sendJson({ type: "text", text: "change la couleur" });
+  await c.next("response_done");
+  await sleep(350);
+
+  c.turn("start");
+  c.say("euh");
+  c.turn("eager_end");
+  await sleep(120);
+  assert.equal(c.events.filter((e) => e.type === "user_turn").length, 1); // unsure: wait for the turn to end
+  c.turn("resume");
+  c.say(" rouge");
+  c.turn("eager_end");
+  // No `end` is ever sent: the decision alone releases the reply.
+  assert.equal((await c.next("user_turn", 1)).text, "euh rouge");
+  assert.equal((await c.next("response_done", 1)).text, "Rouge, donc.");
+  assert.deepEqual(llm.decisions.at(-1)?.state, {
+    conversation: [
+      { role: "user", said: "change la couleur" },
+      { role: "assistant", said: "Quelle couleur ?" },
+    ],
+    user_said: "euh rouge",
+    last_segment: "rouge",
+  });
+  c.ws.close();
+});
+
+test("decider: a hanging sentence is still answered if the user does not go on", async () => {
+  llm.onDecision = () => noul(0.05);
+  const c = await open({ speculate: false }, deciding);
+  await c.next("ready");
+  c.turn("start");
+  c.say("et puis euh");
+  c.turn("end");
+  const started = Date.now();
+  assert.equal((await c.next("user_turn")).text, "et puis euh");
+  assert.ok(Date.now() - started >= 1000, "should have waited before answering");
+  await c.next("response_done");
+  c.ws.close();
+});
+
+test("decider: the LLM is only woken mid-sentence once there is something to act on", async () => {
+  llm.onDecision = (_id, _q, state) => noul(String(state["user_is_saying"]).includes("rouge") ? 0.9 : 0.1);
+  llm.script({ toolCalls: [{ id: "g1", name: "set_color", arguments: '{"color":"red"}' }] }, { text: ["Voilà."] });
+  const c = await open({ tools: [{ name: "set_color", description: "Change the color", immediate: true }] }, deciding);
+  await c.next("ready");
+  c.turn("start");
+  c.say("mets la page");
+  await sleep(100);
+  assert.equal(llm.decisions.length, 1, JSON.stringify(llm.decisions));
+  assert.equal(llm.requests.length, 0); // "nothing to do yet": the LLM was not called
+  c.say(" en rouge");
+  const call = await c.next("tool_call");
+  assert.equal(call.early, true);
+  assert.deepEqual(llm.decisions.at(-1)?.state, {
+    user_is_saying: "mets la page en rouge",
+    tools: [{ name: "set_color", description: "Change the color" }],
+    already_done: [],
+  });
+  c.ws.close();
+});
+
+test("decider: when it fails, the conversation falls back on its rules of thumb", async () => {
+  llm.onDecision = () => "fail";
+  llm.script({ text: ["Une phrase pour commencer. ", "Puis une autre"], hangMs: 1500 }, { text: ["Oui ?"] });
+  const c = await open({}, deciding);
+  await c.next("ready");
+  c.sendJson({ type: "text", text: "raconte" });
+  while (c.audio.length === 0) await sleep(10);
+  c.turn("start");
+  c.say("attends stop");
+  await c.next("interrupt");
+  c.turn("end");
+  assert.equal((await c.next("user_turn", 1)).text, "attends stop");
+  c.ws.close();
+});
+
+test("POST /v1/decide relays typed questions to the decision model", async () => {
+  llm.onDecision = (id) => (id === "urgent" ? noul(0.8) : { type: "choice", choice: "billing" });
+  const ask = (target: RunningServer, body: unknown) =>
+    fetch(`http://127.0.0.1:${target.port}/v1/decide`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${TEST_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  const body = {
+    model: "liquid/d1.1",
+    state: { ticket: "Je n'arrive plus à payer" },
+    questions: {
+      urgent: { type: "noul", instructions: "Is it urgent?" },
+      team: { type: "choice", criteria: { billing: "Payments", tech: "Bugs" } },
+    },
+  };
+  const ok = await ask(deciding, body);
+  assert.equal(ok.status, 200);
+  const result = (await ok.json()) as { answers: Record<string, unknown>; model: string; latencyMs: number };
+  assert.deepEqual(result.answers, { urgent: noul(0.8), team: { type: "choice", choice: "billing" } });
+  assert.equal(result.model, "liquid/d1.1");
+  assert.equal(typeof result.latencyMs, "number");
+  assert.equal(llm.decisions[0]?.model, "liquid/d1.1");
+
+  assert.equal((await ask(deciding, { state: "x" })).status, 400);
+  assert.equal((await ask(server, body)).status, 503); // no key configured there
 });
