@@ -769,7 +769,7 @@ new Audio(URL.createObjectURL(await res.blob())).play();
 | `MAX_TTS_CHARS` | no | `8000` | max characters per `/v1/speak` request |
 | `MAX_UPLOAD_BYTES` | no | `26214400` (25 MB) | bulk upload cap (also caps `/v1/speak` bodies) |
 | `MAX_SESSIONS` | no | `20` | concurrent realtime sessions |
-| `MAX_SESSION_MS` | no | `600000` (10 min) | per-session duration cap |
+| `MAX_SESSION_MS` | no | `1800000` (30 min) | per-session duration cap |
 | `IDLE_TIMEOUT_MS` | no | `60000` | close sessions with no client frames |
 | `DEFAULT_TARGET_DELAY_MS` | no | `480` | default latency/accuracy tradeoff (80–1200 or 2400) |
 | `MISTRAL_BASE_URL` | no | `https://api.mistral.ai` | upstream override (tests/mock) |

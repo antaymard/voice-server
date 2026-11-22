@@ -271,7 +271,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     maxTtsChars: intEnv(env, "MAX_TTS_CHARS", 8000),
     maxUploadBytes: intEnv(env, "MAX_UPLOAD_BYTES", 25 * 1024 * 1024),
     maxSessions: intEnv(env, "MAX_SESSIONS", 20),
-    maxSessionMs: intEnv(env, "MAX_SESSION_MS", 10 * 60 * 1000),
+    maxSessionMs: intEnv(env, "MAX_SESSION_MS", 30 * 60 * 1000),
     idleTimeoutMs: intEnv(env, "IDLE_TIMEOUT_MS", 60 * 1000),
     defaultTargetDelayMs: intEnv(env, "DEFAULT_TARGET_DELAY_MS", 480),
     mistralBaseUrl: env["MISTRAL_BASE_URL"] || "https://api.mistral.ai",
